@@ -1,0 +1,173 @@
+name: Release Desktop
+
+# Triggered by pushing a tag like v0.1.0 or v1.2.3
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+
+permissions:
+  contents: write  # needed to create the GitHub Release
+
+jobs:
+  # ─────────────────────────────────────────────────────────
+  # Create the GitHub Release first; subsequent jobs upload to it
+  # ─────────────────────────────────────────────────────────
+  create-release:
+    name: Create release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.gh.outputs.upload_url }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create draft release
+        id: gh
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Volt ${{ steps.tag.outputs.tag }}
+          draft: true       # we publish manually after artifacts are uploaded
+          prerelease: ${{ contains(steps.tag.outputs.tag, '-') }}
+          body: |
+            ## Volt ${{ steps.tag.outputs.tag }}
+
+            <!-- Fill in the release notes before publishing. -->
+
+  # ─────────────────────────────────────────────────────────
+  # Build per-OS — runs in parallel
+  # ─────────────────────────────────────────────────────────
+  build:
+    name: Build (${{ matrix.os }})
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: mac
+          - os: windows-latest
+            platform: win
+          - os: ubuntu-latest
+            platform: linux
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # Native modules need build tools on Linux
+      - name: Linux deps
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev rpm fakeroot dpkg
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared package
+        run: pnpm --filter @volt/shared build
+
+      # ─────────────────────────────────────────────
+      # macOS code signing + notarization
+      # ─────────────────────────────────────────────
+      - name: Import macOS code signing cert
+        if: matrix.platform == 'mac'
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTIFICATE_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+        run: |
+          # electron-builder will pick these up from env automatically.
+          # We just need to ensure the runner has a temporary keychain.
+          echo "macOS signing inputs validated"
+          if [ -z "$CSC_LINK" ]; then
+            echo "::warning::No MAC_CERTIFICATE_BASE64 secret. Building unsigned."
+          fi
+
+      - name: Build macOS
+        if: matrix.platform == 'mac'
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTIFICATE_BASE64 }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          # Notarization (Apple Developer ID required, set as secrets)
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pnpm --filter @volt/desktop build:mac --publish never
+
+      # ─────────────────────────────────────────────
+      # Windows code signing
+      # ─────────────────────────────────────────────
+      - name: Decode Windows cert
+        if: matrix.platform == 'win'
+        env:
+          WIN_CERT: ${{ secrets.WIN_CERTIFICATE_BASE64 }}
+        run: |
+          if [ -n "$WIN_CERT" ]; then
+            echo "$WIN_CERT" | base64 --decode > $env:RUNNER_TEMP\\win-cert.pfx
+            echo "CSC_LINK=$env:RUNNER_TEMP\\win-cert.pfx" >> $env:GITHUB_ENV
+          else
+            echo "::warning::No WIN_CERTIFICATE_BASE64 secret. Building unsigned."
+          fi
+        shell: bash
+
+      - name: Build Windows
+        if: matrix.platform == 'win'
+        env:
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CERTIFICATE_PASSWORD }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pnpm --filter @volt/desktop build:win --publish never
+
+      # ─────────────────────────────────────────────
+      # Linux — no code signing for AppImage/deb
+      # ─────────────────────────────────────────────
+      - name: Build Linux
+        if: matrix.platform == 'linux'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pnpm --filter @volt/desktop build:linux --publish never
+
+      # ─────────────────────────────────────────────
+      # Upload artifacts to GitHub Release
+      # ─────────────────────────────────────────────
+      - name: Upload release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag }}
+          draft: true
+          fail_on_unmatched_files: false
+          files: |
+            apps/desktop/release/**/*.dmg
+            apps/desktop/release/**/*.zip
+            apps/desktop/release/**/*.exe
+            apps/desktop/release/**/*.AppImage
+            apps/desktop/release/**/*.deb
+            apps/desktop/release/**/latest*.yml

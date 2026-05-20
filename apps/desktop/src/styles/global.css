@@ -1,0 +1,120 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Volt design tokens */
+    --color-bg: 10 10 10;
+    --color-bg-elevated: 23 23 23;
+    --color-border: 38 38 38;
+    --color-text: 250 250 250;
+    --color-text-muted: 163 163 163;
+    --color-accent: 250 204 21; /* yellow-400 — the "Volt" bolt */
+    --color-success: 34 197 94;
+    --color-warning: 234 179 8;
+    --color-error: 239 68 68;
+  }
+
+  /* Disable text selection on UI chrome, allow on content */
+  body {
+    user-select: none;
+    -webkit-app-region: no-drag;
+  }
+  input, textarea, [contenteditable], .selectable {
+    user-select: text;
+  }
+
+  /* Draggable title bar on macOS */
+  .titlebar {
+    -webkit-app-region: drag;
+  }
+  .titlebar button,
+  .titlebar input,
+  .titlebar select,
+  .titlebar a,
+  .titlebar [role="combobox"],
+  .titlebar [role="menu"] {
+    -webkit-app-region: no-drag;
+  }
+}
+
+/* Scrollbar styling — dark theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(64 64 64);
+  border-radius: 5px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(82 82 82);
+}
+
+/* {{variable}} highlighting inside CodeMirror (body editor). */
+.cm-volt-var {
+  color: rgb(var(--color-accent));
+  background: rgb(var(--color-accent) / 0.12);
+  border-radius: 2px;
+  padding: 0 1px;
+}
+
+/* Indeterminate progress bar for in-flight requests (ResponseViewer). */
+@keyframes volt-indeterminate {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(400%); }
+}
+.volt-indeterminate-bar {
+  animation: volt-indeterminate 1.2s linear infinite;
+}
+
+/* Minimal "prose" styling for the markdown preview in CollectionDocsModal.
+   Intentionally small — we just need readable hierarchy on top of Tailwind's
+   preflight reset. */
+.prose-volt h1 { font-size: 1.4rem; font-weight: 700; margin: 0.75rem 0 0.5rem; }
+.prose-volt h2 { font-size: 1.2rem; font-weight: 600; margin: 0.75rem 0 0.4rem; }
+.prose-volt h3 { font-size: 1.05rem; font-weight: 600; margin: 0.6rem 0 0.35rem; }
+.prose-volt h4, .prose-volt h5, .prose-volt h6 { font-weight: 600; margin: 0.5rem 0 0.3rem; }
+.prose-volt p { margin: 0.4rem 0; }
+.prose-volt ul, .prose-volt ol { margin: 0.4rem 0 0.4rem 1.25rem; }
+.prose-volt ul { list-style: disc; }
+.prose-volt ol { list-style: decimal; }
+.prose-volt li { margin: 0.15rem 0; }
+.prose-volt a { color: rgb(var(--color-accent)); text-decoration: underline; }
+.prose-volt code {
+  font-family: 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+  background: rgb(var(--color-bg-elevated));
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+.prose-volt pre {
+  background: rgb(var(--color-bg-elevated));
+  padding: 0.6rem 0.75rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 0.5rem 0;
+}
+.prose-volt pre code { background: transparent; padding: 0; }
+.prose-volt blockquote {
+  border-left: 3px solid rgb(var(--color-border));
+  padding-left: 0.6rem;
+  margin: 0.5rem 0;
+  color: rgb(var(--color-text-muted));
+}
+.prose-volt table {
+  border-collapse: collapse;
+  margin: 0.5rem 0;
+}
+.prose-volt th, .prose-volt td {
+  border: 1px solid rgb(var(--color-border));
+  padding: 0.25rem 0.6rem;
+}
+.prose-volt th { background: rgb(var(--color-bg-elevated)); text-align: left; }
+.prose-volt hr { border: 0; border-top: 1px solid rgb(var(--color-border)); margin: 0.75rem 0; }
+.prose-volt img { max-width: 100%; }
+.prose-volt input[type="checkbox"] { margin-right: 0.4rem; }

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm exec *)",
+      "Bash(echo \"EXIT=$?\")",
+      "Bash(pnpm --filter @volt/desktop add @codemirror/lang-markdown marked)"
+    ]
+  }
+}

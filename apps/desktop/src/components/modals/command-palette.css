@@ -1,0 +1,50 @@
+/* cmdk styles — focused on a centered floating palette */
+.cmd-palette {
+  position: fixed;
+  left: 50%;
+  top: 20%;
+  z-index: 50;
+  width: 90%;
+  max-width: 560px;
+  transform: translateX(-50%);
+
+  background: rgb(var(--color-bg-elevated));
+  border: 1px solid rgb(var(--color-border));
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+}
+
+[cmdk-overlay] {
+  position: fixed;
+  inset: 0;
+  z-index: 49;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+}
+
+.cmd-group {
+  padding: 4px;
+}
+.cmd-group [cmdk-group-heading] {
+  padding: 6px 8px;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: rgb(var(--color-text-muted));
+}
+
+.cmd-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  font-size: 13px;
+  cursor: pointer;
+  color: rgb(var(--color-text));
+}
+.cmd-item[data-selected='true'] {
+  background: rgb(var(--color-bg));
+}

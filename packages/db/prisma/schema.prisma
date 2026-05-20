@@ -1,0 +1,291 @@
+// Volt — Backend Prisma schema (sync mirror)
+//
+// Mirrors the local SQLite schema but adds:
+// - User / Session / Device for identity
+// - Team / TeamMember / TeamInvite for sharing
+// - revision integer on every syncable row (engine of last-write-wins)
+// - Workspace.currentRevision (monotonic counter per workspace)
+// - ConflictLog (30-day retention of overwritten state)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────
+// Identity
+// ─────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  sessions       Session[]
+  devices        Device[]
+  ownedTeams     Team[]            @relation("TeamOwner")
+  memberships    TeamMember[]
+  personalWorkspaces Workspace[]   @relation("WorkspaceOwner")
+  invitesSent    TeamInvite[]      @relation("InviteCreator")
+  conflictsCaused ConflictLog[]    @relation("ConflictAuthor")
+
+  @@map("users")
+}
+
+// Lucia session
+model Session {
+  id        String   @id
+  userId    String   @map("user_id") @db.Uuid
+  expiresAt DateTime @map("expires_at")
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device Device? @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  deviceId String? @map("device_id") @db.Uuid
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+// A "device" = one logged-in client instance.
+// Used for the "log out this device" feature.
+model Device {
+  id         String   @id @default(uuid()) @db.Uuid
+  userId     String   @map("user_id") @db.Uuid
+  label      String   // "Ahmet's MacBook Pro"
+  platform   String   // "macos" | "windows" | "linux"
+  appVersion String   @map("app_version")
+  lastSeenAt DateTime @default(now()) @map("last_seen_at")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  sessions Session[]
+
+  @@index([userId])
+  @@map("devices")
+}
+
+// ─────────────────────────────────────────────────────────
+// Teams
+// ─────────────────────────────────────────────────────────
+
+enum TeamRole {
+  OWNER
+  EDITOR
+  VIEWER
+}
+
+model Team {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  ownerId   String   @map("owner_id") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  owner      User         @relation("TeamOwner", fields: [ownerId], references: [id])
+  members    TeamMember[]
+  invites    TeamInvite[]
+  workspaces Workspace[]  @relation("WorkspaceTeam")
+
+  @@map("teams")
+}
+
+model TeamMember {
+  id       String   @id @default(uuid()) @db.Uuid
+  teamId   String   @map("team_id") @db.Uuid
+  userId   String   @map("user_id") @db.Uuid
+  role     TeamRole @default(EDITOR)
+  joinedAt DateTime @default(now()) @map("joined_at")
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([teamId, userId])
+  @@index([userId])
+  @@map("team_members")
+}
+
+model TeamInvite {
+  id         String    @id @default(uuid()) @db.Uuid
+  teamId     String    @map("team_id") @db.Uuid
+  email      String
+  code       String    @unique // URL-safe, 32 chars
+  createdBy  String    @map("created_by") @db.Uuid
+  expiresAt  DateTime  @map("expires_at")
+  acceptedAt DateTime? @map("accepted_at")
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  team    Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+  creator User @relation("InviteCreator", fields: [createdBy], references: [id])
+
+  @@index([code])
+  @@index([email])
+  @@map("team_invites")
+}
+
+// ─────────────────────────────────────────────────────────
+// Workspace + synced content
+// ─────────────────────────────────────────────────────────
+
+model Workspace {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String
+  // Exactly one of these is set
+  ownerUserId     String?  @map("owner_user_id") @db.Uuid
+  ownerTeamId     String?  @map("owner_team_id") @db.Uuid
+  // Monotonic counter; increments per applied change.
+  currentRevision BigInt   @default(0) @map("current_revision")
+  deletedAt       DateTime? @map("deleted_at") // soft delete, 30-day recovery
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  ownerUser    User?         @relation("WorkspaceOwner", fields: [ownerUserId], references: [id], onDelete: Cascade)
+  ownerTeam    Team?         @relation("WorkspaceTeam", fields: [ownerTeamId], references: [id], onDelete: Cascade)
+  collections  Collection[]
+  requests     ApiRequest[]
+  environments Environment[]
+  history      HistoryEntry[]
+  conflicts    ConflictLog[]
+
+  @@index([ownerUserId])
+  @@index([ownerTeamId])
+  @@map("workspaces")
+}
+
+// All syncable rows below share the same shape:
+// - id: UUID set by client (so client can reference before sync)
+// - workspaceId
+// - revision: BigInt, server-assigned, monotonic per workspace
+// - deletedAt: soft delete for sync (deletion is a regular change)
+//
+// The client tracks last-seen revision per workspace; pull returns
+// all rows with revision > last_seen.
+
+model Collection {
+  id           String    @id @db.Uuid
+  workspaceId  String    @map("workspace_id") @db.Uuid
+  parentId     String?   @map("parent_id") @db.Uuid // nested folders
+  name         String
+  description  String    @default("") // markdown documentation
+  sortOrder    Int       @default(0) @map("sort_order")
+  variables    Json      @default("[]") // [{ key, value, secretRef? }]
+  revision     BigInt
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, revision])
+  @@index([parentId])
+  @@map("collections")
+}
+
+model ApiRequest {
+  id              String    @id @db.Uuid
+  workspaceId     String    @map("workspace_id") @db.Uuid
+  collectionId    String?   @map("collection_id") @db.Uuid
+  name            String
+  method          String
+  url             String
+  // Stored as JSON (Postgres jsonb) since shapes vary per request.
+  headers         Json      @default("[]")  // [{ key, value, enabled, description }]
+  queryParams     Json      @default("[]")  @map("query_params")
+  bodyType        String    @default("none") @map("body_type") // none|raw|form|urlencoded|binary
+  body            Json      @default("{}")  // shape depends on bodyType
+  auth            Json      @default("{\"type\":\"none\"}")
+  preRequestScript  String  @default("") @map("pre_request_script")
+  postResponseScript String @default("") @map("post_response_script")
+  description     String    @default("")
+  examples        Json      @default("[]") // RequestExample[]
+  sortOrder       Int       @default(0) @map("sort_order")
+  revision        BigInt
+  deletedAt       DateTime? @map("deleted_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, revision])
+  @@index([collectionId])
+  @@map("api_requests")
+}
+
+model Environment {
+  id          String    @id @db.Uuid
+  workspaceId String    @map("workspace_id") @db.Uuid
+  name        String
+  sortOrder   Int       @default(0) @map("sort_order")
+  variables   Json      @default("[]") // [{ key, value, secretRef? }]
+  revision    BigInt
+  deletedAt   DateTime? @map("deleted_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, revision])
+  @@map("environments")
+}
+
+// ─────────────────────────────────────────────────────────
+// History — sent requests + responses. Body bytes are NOT
+// uploaded (kept only on the originating device); cloud copy
+// stores metadata only (status, headers, timing, snapshot).
+// ─────────────────────────────────────────────────────────
+
+model HistoryEntry {
+  id                  String    @id @db.Uuid
+  workspaceId         String    @map("workspace_id") @db.Uuid
+  requestId           String?   @map("request_id") @db.Uuid
+  method              String
+  url                 String
+  // The fully-resolved request that was sent (headers + body + auth at send time)
+  requestSnapshot     Json      @map("request_snapshot")
+  statusCode          Int?      @map("status_code")
+  responseHeaders     Json?     @map("response_headers")
+  responseSizeBytes   Int?      @map("response_size_bytes")
+  responseContentType String?   @map("response_content_type")
+  startedAt           DateTime  @map("started_at")
+  durationMs          Int       @map("duration_ms")
+  errorCode           String?   @map("error_code")
+  pinned              Boolean   @default(false)
+  revision            BigInt
+  deletedAt           DateTime? @map("deleted_at")
+  createdAt           DateTime  @default(now()) @map("created_at")
+  updatedAt           DateTime  @updatedAt @map("updated_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, revision])
+  @@index([workspaceId, startedAt(sort: Desc)])
+  @@map("history_entries")
+}
+
+// ─────────────────────────────────────────────────────────
+// Conflict log (30-day retention, viewable by user)
+// ─────────────────────────────────────────────────────────
+
+model ConflictLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  workspaceId    String   @map("workspace_id") @db.Uuid
+  table          String   // "collection" | "api_request" | "environment"
+  rowId          String   @map("row_id") @db.Uuid
+  // The state that was overwritten — full snapshot of the row's fields.
+  previousState  Json     @map("previous_state")
+  overwrittenBy  String   @map("overwritten_by") @db.Uuid
+  overwrittenAt  DateTime @default(now()) @map("overwritten_at")
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  author    User      @relation("ConflictAuthor", fields: [overwrittenBy], references: [id])
+
+  @@index([workspaceId, overwrittenAt])
+  @@map("conflict_log")
+}

@@ -1,0 +1,51 @@
+{
+  "name": "@volt/shared",
+  "version": "0.1.0",
+  "private": true,
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./auth": {
+      "source": "./src/schemas/auth.ts",
+      "types": "./dist/schemas/auth.d.ts",
+      "default": "./dist/schemas/auth.js"
+    },
+    "./workspace": {
+      "source": "./src/schemas/workspace.ts",
+      "types": "./dist/schemas/workspace.d.ts",
+      "default": "./dist/schemas/workspace.js"
+    },
+    "./request": {
+      "source": "./src/schemas/request.ts",
+      "types": "./dist/schemas/request.d.ts",
+      "default": "./dist/schemas/request.js"
+    },
+    "./sync": {
+      "source": "./src/schemas/sync.ts",
+      "types": "./dist/schemas/sync.d.ts",
+      "default": "./dist/schemas/sync.js"
+    },
+    "./ipc": {
+      "source": "./src/ipc/contracts.ts",
+      "types": "./dist/ipc/contracts.d.ts",
+      "default": "./dist/ipc/contracts.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'noop'"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

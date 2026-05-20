@@ -1,0 +1,26 @@
+node_modules/
+.turbo/
+dist/
+build/
+out/
+*.log
+.env
+.env.local
+.env.*.local
+.DS_Store
+coverage/
+*.tsbuildinfo
+
+# Electron
+apps/desktop/dist/
+apps/desktop/dist-electron/
+apps/desktop/release/
+
+# Local DB files (for dev tests)
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+
+# Prisma generated
+packages/db/generated/

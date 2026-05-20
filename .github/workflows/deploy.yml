@@ -1,0 +1,106 @@
+name: Deploy Backend
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'apps/backend/**'
+      - 'packages/shared/**'
+      - 'packages/db/**'
+      - 'docker-compose.prod.yml'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+# Don't run multiple deploys in parallel
+concurrency:
+  group: deploy-backend-prod
+  cancel-in-progress: false
+
+jobs:
+  build-and-push:
+    name: Build + push Docker image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag
+        id: meta
+        run: |
+          # Tag = <short SHA>; latest also moves
+          SHORT=$(git rev-parse --short HEAD)
+          echo "tag=$SHORT" >> $GITHUB_OUTPUT
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build + push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./apps/backend/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/volt-backend:${{ steps.meta.outputs.tag }}
+            ghcr.io/${{ github.repository_owner }}/volt-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to VPS
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy
+          chmod 600 ~/.ssh/deploy
+          ssh-keyscan -H ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copy compose file
+        run: |
+          scp -i ~/.ssh/deploy docker-compose.prod.yml \
+            deploy@${{ secrets.DEPLOY_HOST }}:/srv/volt/docker-compose.yml
+
+      - name: Pull + restart
+        # The compose file references ghcr.io/.../volt-backend:latest, which
+        # we just pushed. `--remove-orphans` cleans up old service definitions.
+        run: |
+          ssh -i ~/.ssh/deploy deploy@${{ secrets.DEPLOY_HOST }} <<'EOF'
+            set -e
+            cd /srv/volt
+            echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ secrets.GHCR_USER }} --password-stdin
+            docker compose pull backend
+            docker compose up -d --remove-orphans backend
+            # Apply any pending migrations (idempotent)
+            docker compose exec -T backend node ./node_modules/.bin/prisma migrate deploy
+            docker compose ps
+          EOF
+
+      - name: Health check
+        # Give it a few seconds to come up, then verify the API is responding.
+        # Failure here = roll-back manually (alert in the next step).
+        run: |
+          for i in {1..30}; do
+            if curl -fsS https://api.${{ secrets.DEPLOY_DOMAIN }}/api/health > /dev/null; then
+              echo "✓ Backend healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Backend failed health check after 60s"
+          exit 1
