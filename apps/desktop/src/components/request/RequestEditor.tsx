@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Send, Save, Loader2, X } from 'lucide-react';
+import { Code2, FileCode2, Send, Save, Loader2, X } from 'lucide-react';
 import { useQueryClient } from '@tanstack/react-query';
 
 import { Button } from '@/components/ui/Button';
@@ -10,6 +10,8 @@ import { KeyValueEditor } from './KeyValueEditor';
 import { BodyEditor, type Body } from './BodyEditor';
 import { AuthEditor } from './AuthEditor';
 import { CodeEditor } from './CodeEditor';
+import { AutoHeadersEditor } from '@/components/modals/AutoHeadersEditor';
+import { VariablesProvider } from '@/lib/variables-context';
 import {
   useActiveEnv,
   useCollections,
@@ -19,6 +21,8 @@ import {
   useUpdateRequest,
 } from '@/hooks/useData';
 import { useDrafts } from '@/stores/drafts';
+import { useModals } from '@/stores/modals';
+import { useSelection } from '@/stores/selection';
 import { useHotkey } from '@/hooks/useHotkey';
 import { voltApi } from '@/lib/volt-api';
 import { cn, methodColorClass, rowId } from '@/lib/util';
@@ -47,9 +51,226 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
   const qc = useQueryClient();
 
   const { drafts, setDraft, clearDraft, patchDraft, setInFlight, inFlight } = useDrafts();
+  const { open: openModal } = useModals();
   const draft = drafts.get(requestId);
   const sendIdRef = useRef<string | null>(null);
   const [sending, setSending] = useState(false);
+
+  // Active editor tab. Controlled so we can jump to "examples" automatically
+  // when the user clicks an example row in the sidebar.
+  const [tab, setTab] = useState<string>('params');
+  const selectedExampleId = useSelection((s) => s.selectedExampleId);
+  const setSelectedExampleId = useSelection((s) => s.setSelectedExampleId);
+
+  // ── Example editing mode ──────────────────────────────────────────────
+  // When the user picks an example in the sidebar (or the Examples panel),
+  // we lift its snapshot into a *working copy* (exampleWorking). All editor
+  // tabs read from this copy and edits route back into it with a debounced
+  // save that writes the patched example back to the request's examples[].
+  // Switching examples or leaving example mode flushes any pending save so
+  // edits aren't dropped.
+  const activeExample = useMemo(() => {
+    if (!selectedExampleId) return null;
+    const examples = ((saved as { examples?: ExampleRow[] } | undefined)?.examples ?? []) as ExampleRow[];
+    return examples.find((e) => e.id === selectedExampleId) ?? null;
+  }, [selectedExampleId, saved]);
+
+  const [exampleWorking, setExampleWorking] = useState<{
+    exampleId: string;
+    example: ExampleRow;
+  } | null>(null);
+  const exampleWorkingRef = useRef(exampleWorking);
+  exampleWorkingRef.current = exampleWorking;
+  const pendingSaveTimerRef = useRef<number | null>(null);
+  // Tracks whether there are unflushed edits — drives the small status pill.
+  const [exampleSaveStatus, setExampleSaveStatus] = useState<'idle' | 'pending' | 'saving'>(
+    'idle',
+  );
+
+  const flushExampleSave = useCallback(() => {
+    if (pendingSaveTimerRef.current != null) {
+      clearTimeout(pendingSaveTimerRef.current);
+      pendingSaveTimerRef.current = null;
+    }
+    const working = exampleWorkingRef.current;
+    if (!working) return;
+    // Read the *latest* request from React Query's cache instead of the
+    // closure-captured `saved`. Otherwise, when an example is deleted while
+    // edits are pending, this code path could reinsert it from a stale array.
+    const currentRequest = qc.getQueryData<{ examples?: ExampleRow[] }>([
+      'request',
+      requestId,
+    ]);
+    const examples = (currentRequest?.examples ?? []) as ExampleRow[];
+    if (!examples.some((e) => e.id === working.exampleId)) {
+      // Example was deleted under us — drop the pending edits silently.
+      setExampleSaveStatus('idle');
+      return;
+    }
+    const nextExamples = examples.map((e) =>
+      e.id === working.exampleId ? working.example : e,
+    );
+    setExampleSaveStatus('saving');
+    updateRequest
+      .mutateAsync({ id: requestId, examples: nextExamples })
+      .then(() => setExampleSaveStatus('idle'))
+      .catch(() => setExampleSaveStatus('pending'));
+  }, [qc, requestId, updateRequest]);
+
+  const scheduleExampleSave = useCallback(() => {
+    if (pendingSaveTimerRef.current != null) {
+      clearTimeout(pendingSaveTimerRef.current);
+    }
+    setExampleSaveStatus('pending');
+    pendingSaveTimerRef.current = window.setTimeout(() => {
+      pendingSaveTimerRef.current = null;
+      flushExampleSave();
+    }, 500);
+  }, [flushExampleSave]);
+
+  // Re-init the working copy whenever the user switches examples (or leaves
+  // example mode). Flush the previous example's pending edits first so they
+  // aren't dropped when its working copy disappears.
+  useEffect(() => {
+    if (
+      exampleWorkingRef.current &&
+      activeExample?.id !== exampleWorkingRef.current.exampleId
+    ) {
+      flushExampleSave();
+    }
+    if (!activeExample) {
+      setExampleWorking(null);
+      return;
+    }
+    setExampleWorking({ exampleId: activeExample.id, example: activeExample });
+    // Intentionally only react to *which* example is active, not to inner
+    // edits from `saved` — otherwise every debounced save would overwrite
+    // the local working copy mid-typing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeExample?.id]);
+
+  // Flush on unmount so pending edits aren't dropped if user navigates away.
+  useEffect(() => {
+    return () => {
+      if (pendingSaveTimerRef.current != null) {
+        clearTimeout(pendingSaveTimerRef.current);
+        flushExampleSave();
+      }
+    };
+  }, [flushExampleSave]);
+
+  const isExampleMode = exampleWorking != null;
+
+  // Unified read accessors — every tab pulls from here so we don't have to
+  // sprinkle `isExampleMode ? … : draft.…` across the JSX.
+  const activeName = isExampleMode ? exampleWorking!.example.name : draft?.name ?? '';
+  const activeRequest: {
+    method: string;
+    url: string;
+    headers: Array<{ key: string; value: string }>;
+    queryParams: Array<{ key: string; value: string }>;
+    bodyType: string;
+    body: unknown;
+    auth: unknown;
+    preRequestScript: string;
+    postResponseScript: string;
+  } = isExampleMode
+    ? {
+        method: exampleWorking!.example.request.method,
+        url: exampleWorking!.example.request.url,
+        headers: exampleWorking!.example.request.headers ?? [],
+        queryParams: exampleWorking!.example.request.queryParams ?? [],
+        bodyType: exampleWorking!.example.request.bodyType ?? 'none',
+        body: exampleWorking!.example.request.body,
+        auth: exampleWorking!.example.request.auth ?? { type: 'none' },
+        preRequestScript: exampleWorking!.example.request.preRequestScript ?? '',
+        postResponseScript: exampleWorking!.example.request.postResponseScript ?? '',
+      }
+    : {
+        method: draft?.method ?? 'GET',
+        url: draft?.url ?? '',
+        headers: (draft?.headers as Array<{ key: string; value: string }>) ?? [],
+        queryParams: (draft?.queryParams as Array<{ key: string; value: string }>) ?? [],
+        bodyType: draft?.bodyType ?? 'none',
+        body: draft?.body,
+        auth: draft?.auth ?? { type: 'none' },
+        preRequestScript: draft?.preRequestScript ?? '',
+        postResponseScript: draft?.postResponseScript ?? '',
+      };
+
+  const setActiveName = useCallback(
+    (name: string) => {
+      if (isExampleMode) {
+        setExampleWorking((cur) =>
+          cur ? { ...cur, example: { ...cur.example, name } } : cur,
+        );
+        scheduleExampleSave();
+      } else {
+        patchDraft(requestId, { name });
+      }
+    },
+    [isExampleMode, scheduleExampleSave, patchDraft, requestId],
+  );
+
+  const patchActive = useCallback(
+    (
+      partial: Partial<{
+        method: string;
+        url: string;
+        headers: unknown;
+        queryParams: unknown;
+        bodyType: string;
+        body: unknown;
+        auth: unknown;
+        preRequestScript: string;
+        postResponseScript: string;
+      }>,
+    ) => {
+      if (isExampleMode) {
+        setExampleWorking((cur) =>
+          cur
+            ? {
+                ...cur,
+                example: {
+                  ...cur.example,
+                  request: { ...cur.example.request, ...(partial as object) },
+                },
+              }
+            : cur,
+        );
+        scheduleExampleSave();
+      } else {
+        patchDraft(requestId, partial as never);
+      }
+    },
+    [isExampleMode, scheduleExampleSave, patchDraft, requestId],
+  );
+
+  const exitExampleMode = useCallback(() => {
+    flushExampleSave();
+    setSelectedExampleId(null);
+  }, [flushExampleSave, setSelectedExampleId]);
+
+  // When the user clicks an example in the sidebar (for *this* request), jump
+  // to the Examples tab. Guarded by a ref so the auto-switch only happens
+  // once per id — manual nav back to Params (or any tab) after a save isn't
+  // overridden by `saved` re-renders carrying the same selectedExampleId.
+  const autoSwitchedExampleRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!selectedExampleId) {
+      autoSwitchedExampleRef.current = null;
+      return;
+    }
+    if (autoSwitchedExampleRef.current === selectedExampleId) return;
+    const examples = (saved as { examples?: ExampleRow[] } | undefined)?.examples;
+    if (examples?.some((e) => e.id === selectedExampleId)) {
+      // First param tab is a sensible default — the user just clicked an
+      // example, so put them on the first content tab rather than the
+      // Examples list panel.
+      setTab('params');
+      autoSwitchedExampleRef.current = selectedExampleId;
+    }
+  }, [selectedExampleId, saved]);
 
   // Initialize draft when saved loads or request changes
   useEffect(() => {
@@ -61,7 +282,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         url: saved.url,
         headers: saved.headers as never,
         queryParams: saved.queryParams as never,
-        bodyType: saved.bodyType,
+        bodyType: (saved as { bodyType?: string }).bodyType ?? (saved.body as { type?: string })?.type ?? 'none',
         body: saved.body,
         auth: saved.auth,
         preRequestScript: (saved as { preRequestScript?: string }).preRequestScript ?? '',
@@ -70,6 +291,61 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId, saved]);
+
+  // Merged variable map (globals → env → collection chain). Each entry carries
+  // not just the value but also which scope it was resolved from, so the
+  // VarEditor popover knows where to persist edits. Precedence: deepest
+  // collection > shallower collection > env > globals (later writes win).
+  const variableMap = useMemo(() => {
+    const env = environments?.find((e) => e.id === activeEnv?.environmentId) ?? null;
+    const chain = saved?.collectionId
+      ? (collectColChain(saved.collectionId, collections ?? []) as Array<{
+          id: string;
+          name?: string;
+          variables?: Array<{ key: string; value: string }>;
+        }>)
+      : [];
+    const m = new Map<string, import('@/lib/variables-context').VarInfo>();
+    for (const [k, v] of Object.entries(globals ?? {})) {
+      if (v != null) {
+        m.set(k, {
+          value: typeof v === 'string' ? v : JSON.stringify(v),
+          scope: 'globals',
+          scopeId: null,
+          scopeName: 'Globals',
+        });
+      }
+    }
+    if (env?.variables) {
+      for (const v of env.variables as Array<{ key: string; value: string }>) {
+        m.set(v.key, {
+          value: v.value,
+          scope: 'env',
+          scopeId: env.id,
+          scopeName: env.name,
+        });
+      }
+    }
+    // Iterate the chain in reverse so deepest collection wins.
+    for (const c of [...chain].reverse()) {
+      if (c.variables) {
+        for (const v of c.variables) {
+          m.set(v.key, {
+            value: v.value,
+            scope: 'collection',
+            scopeId: c.id,
+            scopeName: c.name ?? 'Collection',
+          });
+        }
+      }
+    }
+    return m;
+  }, [globals, environments, activeEnv?.environmentId, collections, saved?.collectionId]);
+
+  const activeEnvName = useMemo(() => {
+    const env = environments?.find((e) => e.id === activeEnv?.environmentId);
+    return env?.name ?? null;
+  }, [environments, activeEnv?.environmentId]);
 
   // Detect dirty
   const dirty = useMemo(() => {
@@ -82,7 +358,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       saved.url !== draft.url ||
       JSON.stringify(saved.headers) !== JSON.stringify(draft.headers) ||
       JSON.stringify(saved.queryParams) !== JSON.stringify(draft.queryParams) ||
-      saved.bodyType !== draft.bodyType ||
+      ((saved as { bodyType?: string }).bodyType ?? '') !== draft.bodyType ||
       JSON.stringify(saved.body) !== JSON.stringify(draft.body) ||
       JSON.stringify(saved.auth) !== JSON.stringify(draft.auth) ||
       savedPre !== draft.preRequestScript ||
@@ -117,8 +393,44 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       ? collectColChain(saved.collectionId, collections ?? [])
       : [];
 
+    // OAuth: if the request uses oauth2, refresh/fetch the token now so the
+    // resolved request can carry the Authorization header. (resolveLocally is
+    // sync; we can't await inside it.)
+    let oauthHeader: { key: string; value: string } | null = null;
+    const draftAuth = draft.auth as { type?: string } | undefined;
+    if (draftAuth?.type === 'oauth2') {
+      try {
+        const r = (await voltApi['oauth:ensureToken'](draft.auth as never)) as {
+          ok: boolean;
+          accessToken?: string;
+          tokenType?: string;
+          error?: string;
+        };
+        if (!r.ok) {
+          onResponse(
+            buildClientError(new Error(r.error ?? 'OAuth token unavailable.'), draft.url),
+          );
+          setSending(false);
+          return;
+        }
+        const prefix =
+          ((draft.auth as { headerPrefix?: string }).headerPrefix as string) ?? 'Bearer';
+        oauthHeader = {
+          key: 'Authorization',
+          value: `${prefix} ${r.accessToken}`,
+        };
+      } catch (err) {
+        onResponse(buildClientError(err, draft.url));
+        setSending(false);
+        return;
+      }
+    }
+
     // Resolve client-side using globals (lowest priority) + env + collections.
     const { resolved, variables } = resolveLocally(draft, env, collectionChain, globals ?? {});
+    if (oauthHeader) {
+      resolved.headers[oauthHeader.key] = oauthHeader.value;
+    }
 
     const id = rowId('send');
     sendIdRef.current = id;
@@ -147,6 +459,28 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       qc.invalidateQueries({ queryKey: ['globals'] });
     }
   }, [draft, environments, activeEnv, saved, collections, globals, requestId, workspaceId, setInFlight, onResponse, qc]);
+
+  // Open the CodeGen modal with a snapshot of the currently-resolved request
+  // (URL with vars substituted, headers as a flat record, body in resolved
+  // form). The modal renders curl/fetch/axios/Python/Go/Java/PHP/Ruby snippets.
+  const viewCode = useCallback(() => {
+    if (!draft) return;
+    const env = environments?.find((e) => e.id === activeEnv?.environmentId) ?? null;
+    const collectionChain = saved?.collectionId
+      ? collectColChain(saved.collectionId, collections ?? [])
+      : [];
+    const { resolved } = resolveLocally(draft, env, collectionChain, globals ?? {});
+    openModal({
+      kind: 'codegen',
+      title: draft.name ?? 'Request',
+      request: {
+        method: resolved.method,
+        url: resolved.url,
+        headers: resolved.headers,
+        body: resolved.body,
+      },
+    });
+  }, [draft, environments, activeEnv, saved, collections, globals, openModal]);
 
   // Run an example: re-dispatch the snapshot's request through the current
   // env/globals so {{vars}} are re-resolved with today's values.
@@ -178,9 +512,11 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         const response = await voltApi['request:send']({
           inFlightId: id,
           request: resolved as never,
-          // Examples don't carry their own scripts — use the current request's.
-          preRequestScript: draft?.preRequestScript ?? '',
-          postResponseScript: draft?.postResponseScript ?? '',
+          // Prefer the example's snapshot scripts so re-runs reproduce the
+          // captured behavior. Older examples without snapshot scripts fall
+          // back to whatever the user currently has.
+          preRequestScript: ex.request.preRequestScript ?? draft?.preRequestScript ?? '',
+          postResponseScript: ex.request.postResponseScript ?? draft?.postResponseScript ?? '',
           variables,
           workspaceId,
           environmentId: activeEnv?.environmentId ?? null,
@@ -203,8 +539,30 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
     }
   }, []);
 
-  useHotkey('mod+enter', send, { allowInInputs: true });
-  useHotkey('mod+s', save, { allowInInputs: true });
+  // Send button / Cmd+Enter routes to runExample when in example mode so the
+  // request that fires reflects the example's (possibly just-edited) snapshot.
+  const sendActive = useCallback(async () => {
+    if (isExampleMode && exampleWorking) {
+      // Persist any in-flight edits so what we send matches what's on disk.
+      flushExampleSave();
+      await runExample(exampleWorking.example);
+      return;
+    }
+    await send();
+  }, [isExampleMode, exampleWorking, flushExampleSave, runExample, send]);
+
+  // Save shortcut: flush in example mode (auto-save handles the rest);
+  // commit the draft otherwise.
+  const saveActive = useCallback(() => {
+    if (isExampleMode) {
+      flushExampleSave();
+      return;
+    }
+    void save();
+  }, [isExampleMode, flushExampleSave, save]);
+
+  useHotkey('mod+enter', sendActive, { allowInInputs: true });
+  useHotkey('mod+s', saveActive, { allowInInputs: true });
 
   if (isLoading || !saved || !draft) {
     return (
@@ -215,13 +573,44 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
   }
 
   return (
+    <VariablesProvider
+      value={{
+        vars: variableMap,
+        workspaceId,
+        activeEnvId: activeEnv?.environmentId ?? null,
+        activeEnvName,
+      }}
+    >
     <div className="flex h-full flex-col">
+      {/* Example-mode banner. Sits above the name so it's the first thing
+          users notice — makes it clear that edits don't touch the live request. */}
+      {isExampleMode && (
+        <div className="flex items-center justify-between gap-2 border-b border-accent/30 bg-accent/10 px-3 py-1.5 text-xs">
+          <div className="flex min-w-0 items-center gap-2 text-text">
+            <FileCode2 size={12} className="flex-shrink-0 text-accent" />
+            <span className="truncate">
+              Editing example ·{' '}
+              <span className="font-semibold">{exampleWorking!.example.name}</span>
+            </span>
+            <ExampleSaveBadge status={exampleSaveStatus} />
+          </div>
+          <button
+            type="button"
+            onClick={exitExampleMode}
+            className="rounded px-2 py-0.5 text-text-muted hover:bg-bg hover:text-text"
+            title="Return to the live request"
+          >
+            Back to request
+          </button>
+        </div>
+      )}
+
       {/* Name */}
       <div className="border-b border-border px-3 py-2">
         <input
-          value={draft.name}
-          onChange={(e) => patchDraft(requestId, { name: e.target.value })}
-          placeholder="Untitled request"
+          value={activeName}
+          onChange={(e) => setActiveName(e.target.value)}
+          placeholder={isExampleMode ? 'Example name' : 'Untitled request'}
           className="w-full bg-transparent text-sm font-medium text-text outline-none placeholder:text-text-muted"
         />
       </div>
@@ -229,14 +618,14 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       {/* URL bar */}
       <div className="flex items-center gap-1.5 border-b border-border p-2">
         <Select
-          value={draft.method}
-          onChange={(e) => patchDraft(requestId, { method: e.target.value })}
+          value={activeRequest.method}
+          onChange={(e) => patchActive({ method: e.target.value })}
           options={METHODS.map((m) => ({ value: m, label: m }))}
-          className={cn('w-24 font-mono font-semibold', methodColorClass(draft.method))}
+          className={cn('w-24 font-mono font-semibold', methodColorClass(activeRequest.method))}
         />
         <HighlightedInput
-          value={draft.url}
-          onChange={(e) => patchDraft(requestId, { url: e.target.value })}
+          value={activeRequest.url}
+          onChange={(e) => patchActive({ url: e.target.value })}
           placeholder="https://api.example.com/endpoint"
           className="flex-1"
         />
@@ -246,116 +635,102 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
             Cancel
           </Button>
         ) : (
-          <Button onClick={send} variant="primary" size="md" title="Send (⌘↵)">
+          <Button onClick={sendActive} variant="primary" size="md" title="Send (⌘↵)">
             <Send size={13} />
             Send
           </Button>
         )}
+        {!isExampleMode && (
+          <Button
+            onClick={save}
+            variant={dirty ? 'default' : 'ghost'}
+            size="md"
+            disabled={!dirty}
+            title="Save (⌘S)"
+          >
+            {updateRequest.isPending ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+            {dirty ? 'Save' : 'Saved'}
+          </Button>
+        )}
         <Button
-          onClick={save}
-          variant={dirty ? 'default' : 'ghost'}
+          onClick={viewCode}
+          variant="ghost"
           size="md"
-          disabled={!dirty}
-          title="Save (⌘S)"
+          title="Generate code snippet for this request"
         >
-          {updateRequest.isPending ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
-          {dirty ? 'Save' : 'Saved'}
+          <Code2 size={13} />
+          Code
         </Button>
       </div>
 
       {/* Tabs */}
-      <Tabs defaultValue="params" className="flex flex-1 flex-col overflow-hidden">
+      <Tabs value={tab} onValueChange={setTab} className="flex flex-1 flex-col overflow-hidden">
         <TabsList>
           <TabsTrigger value="params">
             Params
-            {(draft.queryParams as unknown[]).length > 0 && (
+            {activeRequest.queryParams.length > 0 && (
               <span className="ml-1 text-[10px] text-text-muted">
-                {(draft.queryParams as unknown[]).length}
+                {activeRequest.queryParams.length}
               </span>
             )}
           </TabsTrigger>
           <TabsTrigger value="headers">
             Headers
-            {(draft.headers as unknown[]).length > 0 && (
+            {activeRequest.headers.length > 0 && (
               <span className="ml-1 text-[10px] text-text-muted">
-                {(draft.headers as unknown[]).length}
+                {activeRequest.headers.length}
               </span>
             )}
           </TabsTrigger>
           <TabsTrigger value="body">
             Body
-            {draft.bodyType !== 'none' && <span className="ml-1 text-[10px] text-accent">●</span>}
+            {activeRequest.bodyType !== 'none' && <span className="ml-1 text-[10px] text-accent">●</span>}
           </TabsTrigger>
           <TabsTrigger value="auth">
             Auth
-            {(draft.auth as { type: string }).type !== 'none' && (
+            {(activeRequest.auth as { type: string }).type !== 'none' && (
               <span className="ml-1 text-[10px] text-accent">●</span>
             )}
           </TabsTrigger>
           <TabsTrigger value="scripts">
             Scripts
-            {(draft.preRequestScript || draft.postResponseScript) && (
+            {(activeRequest.preRequestScript || activeRequest.postResponseScript) && (
               <span className="ml-1 text-[10px] text-accent">●</span>
             )}
-          </TabsTrigger>
-          <TabsTrigger value="examples">
-            Examples
-            {(saved as { examples?: unknown[] } | undefined)?.examples?.length ? (
-              <span className="ml-1 text-[10px] text-text-muted">
-                {(saved as { examples?: unknown[] } | undefined)?.examples?.length}
-              </span>
-            ) : null}
           </TabsTrigger>
         </TabsList>
 
         <TabsContent value="params" className="overflow-y-auto">
           <KeyValueEditor
-            rows={(draft.queryParams as never) ?? []}
-            onChange={(rows) => patchDraft(requestId, { queryParams: rows as never })}
+            rows={activeRequest.queryParams as never}
+            onChange={(rows) => patchActive({ queryParams: rows as never })}
             keyPlaceholder="Param"
             valuePlaceholder="Value"
           />
         </TabsContent>
 
         <TabsContent value="headers" className="overflow-y-auto">
+          {!isExampleMode && <AutoHeadersEditor />}
           <KeyValueEditor
-            rows={(draft.headers as never) ?? []}
-            onChange={(rows) => patchDraft(requestId, { headers: rows as never })}
+            rows={activeRequest.headers as never}
+            onChange={(rows) => patchActive({ headers: rows as never })}
             keyPlaceholder="Header"
             valuePlaceholder="Value"
+            suggest="headers"
           />
         </TabsContent>
 
         <TabsContent value="body" className="overflow-hidden">
           <BodyEditor
-            body={draft.body as Body}
-            onChange={(body) => patchDraft(requestId, { body, bodyType: body.type })}
+            body={activeRequest.body as Body}
+            onChange={(body) => patchActive({ body, bodyType: body.type })}
           />
         </TabsContent>
 
         <TabsContent value="auth" className="overflow-hidden">
           <AuthEditor
-            auth={draft.auth as never}
-            onChange={(auth) => patchDraft(requestId, { auth: auth as never })}
-          />
-        </TabsContent>
-
-        <TabsContent value="examples" className="overflow-y-auto p-2">
-          <ExamplesPanel
-            examples={
-              ((saved as { examples?: ExampleRow[] } | undefined)?.examples ?? []) as ExampleRow[]
-            }
-            sending={sending}
-            onRun={runExample}
-            onDelete={async (exId) => {
-              const current =
-                ((saved as { examples?: ExampleRow[] } | undefined)?.examples as ExampleRow[]) ??
-                [];
-              await updateRequest.mutateAsync({
-                id: requestId,
-                examples: current.filter((e) => e.id !== exId),
-              });
-            }}
+            auth={activeRequest.auth as never}
+            onChange={(auth) => patchActive({ auth: auth as never })}
           />
         </TabsContent>
 
@@ -367,8 +742,8 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
                 Pre-request
               </div>
               <CodeEditor
-                value={draft.preRequestScript}
-                onChange={(v) => patchDraft(requestId, { preRequestScript: v })}
+                value={activeRequest.preRequestScript}
+                onChange={(v) => patchActive({ preRequestScript: v })}
                 language="javascript"
                 className="flex-1"
                 placeholder="// Runs before the request is sent — see help above."
@@ -379,8 +754,8 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
                 Post-response
               </div>
               <CodeEditor
-                value={draft.postResponseScript}
-                onChange={(v) => patchDraft(requestId, { postResponseScript: v })}
+                value={activeRequest.postResponseScript}
+                onChange={(v) => patchActive({ postResponseScript: v })}
                 language="javascript"
                 className="flex-1"
                 placeholder="// Runs after the response arrives — set globals from response data."
@@ -390,6 +765,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         </TabsContent>
       </Tabs>
     </div>
+    </VariablesProvider>
   );
 }
 
@@ -514,6 +890,19 @@ function resolveLocally(
     };
   } else if (body.type === 'binary') {
     resolvedBody = { type: 'binary', filePath: body.filePath as string };
+  } else if (body.type === 'graphql') {
+    // GraphQL: substitute vars in both the query and the variables JSON. The
+    // engine validates the variables blob is JSON before sending.
+    resolvedBody = {
+      type: 'graphql',
+      query: subst((body.query as string) ?? ''),
+      variables: subst((body.variables as string) ?? ''),
+      operationName: body.operationName as string | undefined,
+    };
+    const hasContentType = Object.keys(headers).some(
+      (k) => k.toLowerCase() === 'content-type',
+    );
+    if (!hasContentType) headers['Content-Type'] = 'application/json';
   }
 
   return {
@@ -542,6 +931,9 @@ interface ExampleRow {
     bodyType: string;
     body: unknown;
     auth: unknown;
+    /** Optional — examples captured before script-snapshot landed won't have these. */
+    preRequestScript?: string;
+    postResponseScript?: string;
   };
   response:
     | {
@@ -562,139 +954,19 @@ interface ExampleRow {
     | null;
 }
 
-function ExamplesPanel({
-  examples,
-  sending,
-  onRun,
-  onDelete,
-}: {
-  examples: ExampleRow[];
-  sending: boolean;
-  onRun: (ex: ExampleRow) => void | Promise<void>;
-  onDelete: (id: string) => void;
-}) {
-  const [selectedId, setSelectedId] = useState<string | null>(examples[0]?.id ?? null);
-  const selected = examples.find((e) => e.id === selectedId) ?? examples[0] ?? null;
-
-  if (examples.length === 0) {
+function ExampleSaveBadge({ status }: { status: 'idle' | 'pending' | 'saving' }) {
+  if (status === 'idle') {
+    return <span className="text-[10px] text-text-muted">Saved</span>;
+  }
+  if (status === 'saving') {
     return (
-      <p className="px-2 py-6 text-center text-xs text-text-muted">
-        No examples saved. Right-click the request → <span className="text-text">Add example</span>{' '}
-        to capture the current request + response as a snapshot.
-      </p>
+      <span className="flex items-center gap-1 text-[10px] text-text-muted">
+        <Loader2 size={9} className="animate-spin" /> Saving…
+      </span>
     );
   }
-
-  return (
-    <div className="flex h-full gap-2">
-      <div className="flex w-48 flex-col gap-1 border-r border-border pr-2">
-        {examples.map((e) => (
-          <div
-            key={e.id}
-            className={cn(
-              'group flex items-center gap-1 rounded',
-              selected?.id === e.id ? 'bg-bg-elevated' : 'hover:bg-bg-elevated/60',
-            )}
-          >
-            <button
-              type="button"
-              onClick={() => setSelectedId(e.id)}
-              className={cn(
-                'flex-1 truncate px-2 py-1 text-left text-xs',
-                selected?.id === e.id ? 'text-text' : 'text-text-muted',
-              )}
-            >
-              {e.name}
-            </button>
-            <button
-              type="button"
-              onClick={() => onRun(e)}
-              disabled={sending}
-              title="Run this example"
-              className="mr-1 rounded p-1 text-text-muted opacity-0 hover:bg-bg hover:text-accent group-hover:opacity-100 disabled:opacity-30"
-            >
-              <Send size={11} />
-            </button>
-          </div>
-        ))}
-      </div>
-      <div className="flex flex-1 flex-col gap-2 overflow-auto text-xs">
-        {selected ? (
-          <>
-            <div className="flex items-center justify-between gap-2 border-b border-border pb-2">
-              <div>
-                <p className="text-13 font-medium text-text">{selected.name}</p>
-                <p className="text-[10px] text-text-muted">
-                  Saved {new Date(selected.createdAt).toLocaleString()}
-                </p>
-              </div>
-              <div className="flex items-center gap-1">
-                <Button
-                  size="sm"
-                  variant="primary"
-                  disabled={sending}
-                  onClick={() => onRun(selected)}
-                  title="Re-send this request snapshot, resolving {{vars}} with current env + globals"
-                >
-                  <Send size={12} />
-                  Run
-                </Button>
-                <button
-                  type="button"
-                  onClick={() => onDelete(selected.id)}
-                  className="rounded p-1 text-text-muted hover:bg-bg hover:text-error"
-                  title="Delete example"
-                >
-                  <X size={13} />
-                </button>
-              </div>
-            </div>
-
-            <section>
-              <h4 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-text-muted">
-                Request
-              </h4>
-              <p className="font-mono text-text">
-                <span className={cn('font-semibold', methodColorClass(selected.request.method))}>
-                  {selected.request.method}
-                </span>{' '}
-                {selected.request.url}
-              </p>
-            </section>
-
-            <section>
-              <h4 className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-text-muted">
-                Response
-              </h4>
-              {!selected.response ? (
-                <p className="text-text-muted">No response captured.</p>
-              ) : selected.response.ok ? (
-                <div className="space-y-1">
-                  <p>
-                    <span className={cn('font-mono font-semibold', methodColorClass('GET'))}>
-                      {selected.response.statusCode}
-                    </span>
-                    <span className="ml-2 text-text-muted">
-                      {selected.response.durationMs}ms · {selected.response.bodySizeBytes} bytes
-                    </span>
-                  </p>
-                  {selected.response.bodyText && (
-                    <pre className="max-h-64 overflow-auto rounded border border-border bg-bg-elevated p-2 font-mono text-[11px] text-text">
-                      {selected.response.bodyText}
-                    </pre>
-                  )}
-                </div>
-              ) : (
-                <p className="text-error">
-                  {selected.response.errorCode}: {selected.response.errorMessage}
-                </p>
-              )}
-            </section>
-          </>
-        ) : null}
-      </div>
-    </div>
-  );
+  // pending — local edits queued for the debounced save.
+  return <span className="text-[10px] text-accent">Unsaved</span>;
 }
 
 function ScriptsHelp() {

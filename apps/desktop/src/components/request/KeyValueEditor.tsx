@@ -1,6 +1,7 @@
 import { Trash2, GripVertical } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
+import { HeaderKeyInput } from '@/components/ui/HeaderKeyInput';
 import { HighlightedInput } from '@/components/ui/HighlightedInput';
 import { cn, rowId } from '@/lib/util';
 
@@ -19,6 +20,8 @@ interface Props {
   valuePlaceholder?: string;
   /** Disable adding/removing rows. */
   readOnly?: boolean;
+  /** When set, the key column autocompletes from common HTTP headers. */
+  suggest?: 'headers';
 }
 
 /**
@@ -32,7 +35,9 @@ export function KeyValueEditor({
   keyPlaceholder = 'Key',
   valuePlaceholder = 'Value',
   readOnly = false,
+  suggest,
 }: Props) {
+  const KeyComponent = suggest === 'headers' ? HeaderKeyInput : HighlightedInput;
   // Ensure there's always a trailing empty row to type into.
   const [internalRows, setInternalRows] = useState<KeyValueRow[]>(() => withEmptyTail(rows));
 
@@ -76,7 +81,7 @@ export function KeyValueEditor({
               disabled={readOnly || isEmpty}
               className="h-3 w-3 accent-accent disabled:opacity-30"
             />
-            <HighlightedInput
+            <KeyComponent
               flat
               value={row.key}
               onChange={(e) => patch(row.id, { key: e.target.value })}

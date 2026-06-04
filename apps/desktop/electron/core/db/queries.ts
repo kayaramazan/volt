@@ -150,6 +150,7 @@ export function updateCollection(
     description?: string;
     sortOrder?: number;
     variables?: unknown;
+    mocks?: unknown;
   },
 ) {
   const existing = getDb().select().from(collections).where(eq(collections.id, id)).get();
@@ -163,6 +164,7 @@ export function updateCollection(
       description: patch.description ?? existing.description,
       sortOrder: patch.sortOrder ?? existing.sortOrder,
       variables: patch.variables !== undefined ? JSON.stringify(patch.variables) : existing.variables,
+      mocks: patch.mocks !== undefined ? JSON.stringify(patch.mocks) : existing.mocks,
       dirty: true,
       updatedAt: now(),
     })
@@ -548,6 +550,14 @@ export function listActiveConflicts(workspaceId: string) {
     .where(and(eq(conflictLog.workspaceId, workspaceId), isNull(conflictLog.dismissedAt)))
     .orderBy(desc(conflictLog.overwrittenAt))
     .all();
+}
+
+export function getConflictById(id: string) {
+  return getDb()
+    .select()
+    .from(conflictLog)
+    .where(eq(conflictLog.id, id))
+    .get();
 }
 
 export function dismissConflict(id: string) {
@@ -979,6 +989,116 @@ export function deleteGlobal(key: string): void {
 }
 
 // ─────────────────────────────────────────────────────────
+// OAuth token cache — persisted in app_state under `oauth.<key>`.
+// ─────────────────────────────────────────────────────────
+
+const OAUTH_PREFIX = 'oauth.';
+export interface OAuthToken {
+  accessToken: string;
+  refreshToken?: string;
+  expiresAt?: number; // epoch ms
+  tokenType?: string;
+}
+export function getOAuthToken(key: string): OAuthToken | null {
+  const raw = getState(OAUTH_PREFIX + key);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as OAuthToken;
+  } catch {
+    return null;
+  }
+}
+export function setOAuthToken(key: string, token: OAuthToken): void {
+  setState(OAUTH_PREFIX + key, JSON.stringify(token));
+}
+export function deleteOAuthToken(key: string): void {
+  deleteState(OAUTH_PREFIX + key);
+}
+
+// ─────────────────────────────────────────────────────────
+// Auto headers — globally configured defaults attached to every outgoing
+// request unless the user defined the same header (case-insensitive) on the
+// request itself. Stored in app_state under `settings.auto_headers`.
+//
+// Dynamic values: the literal string "<auto>" tells the engine to compute it
+// at send time (currently used for Host + Volt-Token).
+// ─────────────────────────────────────────────────────────
+
+export interface AutoHeader {
+  key: string;
+  value: string;
+  enabled: boolean;
+  /** True for built-ins the user shouldn't rename (value/enabled still editable). */
+  builtin?: boolean;
+  /** Human-readable hint shown in the UI. */
+  description?: string;
+}
+
+const AUTO_HEADERS_KEY = 'settings.auto_headers';
+
+export function getAutoHeaders(): AutoHeader[] {
+  const raw = getState(AUTO_HEADERS_KEY);
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as AutoHeader[];
+      if (Array.isArray(parsed)) return parsed;
+    } catch {
+      /* fall through to defaults */
+    }
+  }
+  // Defaults — match what Postman/Insomnia send by convention so server logs
+  // look the same. Volt-Token is per-request UUID for correlation.
+  return [
+    {
+      key: 'User-Agent',
+      value: 'Volt/0.1.0',
+      enabled: true,
+      builtin: true,
+      description: 'Identifies this client in server logs.',
+    },
+    {
+      key: 'Accept',
+      value: '*/*',
+      enabled: true,
+      builtin: true,
+      description: 'Server can return any content type.',
+    },
+    {
+      key: 'Accept-Encoding',
+      value: 'gzip, deflate, br',
+      enabled: true,
+      builtin: true,
+      description: 'Compression schemes this client understands.',
+    },
+    {
+      key: 'Connection',
+      value: 'keep-alive',
+      enabled: true,
+      builtin: true,
+      description: 'Reuse the TCP connection across requests.',
+    },
+    {
+      key: 'Host',
+      value: '<auto>',
+      enabled: true,
+      builtin: true,
+      description: 'Computed from the request URL at send time.',
+    },
+    {
+      key: 'Volt-Token',
+      value: '<auto>',
+      enabled: false,
+      builtin: true,
+      description: 'Per-request UUID for correlating in your server logs.',
+    },
+  ];
+}
+
+export function setAutoHeaders(items: AutoHeader[]): void {
+  setState(AUTO_HEADERS_KEY, JSON.stringify(items));
+}
+
+// ─────────────────────────────────────────────────────────
 // Internals
 // ─────────────────────────────────────────────────────────
 
@@ -999,6 +1119,7 @@ function parseCollection(row: typeof collections.$inferSelect) {
   return {
     ...row,
     variables: safeJsonParse(row.variables, []),
+    mocks: safeJsonParse(row.mocks, []),
   };
 }
 

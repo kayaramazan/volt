@@ -1,10 +1,14 @@
-import { useMemo, useState } from 'react';
-import { Copy, Check, Download, Loader2 } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Copy, Check, Download, FilePlus2, Loader2, Puzzle } from 'lucide-react';
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/Tabs';
-import { Button } from '@/components/ui/Button';
 import { CodeEditor } from '@/components/request/CodeEditor';
+import { useModals } from '@/stores/modals';
+import { usePlugins } from '@/hooks/useData';
 import { cn, formatBytes, formatDuration, statusColorClass, tryDecodeBase64 } from '@/lib/util';
+import { parseCookies, type ParsedCookie } from '@/lib/cookies';
+import { suggestFilename } from '@/lib/contentDisposition';
+import { voltApi } from '@/lib/volt-api';
 
 interface SendResponse {
   ok: boolean;
@@ -32,9 +36,11 @@ interface SendResponse {
 interface Props {
   response: SendResponse | null;
   loading?: boolean;
+  /** When set, the "Save as example" button opens the AddExample modal for this request. */
+  requestId?: string | null;
 }
 
-export function ResponseViewer({ response, loading }: Props) {
+export function ResponseViewer({ response, loading, requestId }: Props) {
   if (!response) {
     if (loading) {
       return (
@@ -99,34 +105,136 @@ export function ResponseViewer({ response, loading }: Props) {
 
       <ScriptOutputBanner pre={response.preScript} post={response.postScript} />
 
-      <Tabs defaultValue="body" className="flex flex-1 flex-col overflow-hidden">
-        <TabsList>
-          <TabsTrigger value="body">Body</TabsTrigger>
-          <TabsTrigger value="headers">
-            Headers
-            {response.headers && response.headers.length > 0 && (
-              <span className="ml-1 text-[10px] text-text-muted">{response.headers.length}</span>
-            )}
-          </TabsTrigger>
-          <TabsTrigger value="timing">Timing</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="body" className="overflow-hidden">
-          <BodyTab response={response} />
-        </TabsContent>
-        <TabsContent value="headers" className="overflow-y-auto">
-          <HeadersTab headers={response.headers ?? []} />
-        </TabsContent>
-        <TabsContent value="timing" className="overflow-y-auto">
-          <TimingTab timing={response.timing} />
-        </TabsContent>
-      </Tabs>
+      <ResponseTabs response={response} requestId={requestId ?? null} />
     </div>
   );
 }
 
-function BodyTab({ response }: { response: SendResponse }) {
+function ResponseTabs({
+  response,
+  requestId,
+}: {
+  response: SendResponse;
+  requestId: string | null;
+}) {
+  const cookies = useMemo(() => parseCookies(response.headers), [response.headers]);
+  return (
+    <Tabs defaultValue="body" className="flex flex-1 flex-col overflow-hidden">
+      <TabsList>
+        <TabsTrigger value="body">Body</TabsTrigger>
+        <TabsTrigger value="headers">
+          Headers
+          {response.headers && response.headers.length > 0 && (
+            <span className="ml-1 text-[10px] text-text-muted">{response.headers.length}</span>
+          )}
+        </TabsTrigger>
+        <TabsTrigger value="cookies">
+          Cookies
+          {cookies.length > 0 && (
+            <span className="ml-1 text-[10px] text-text-muted">{cookies.length}</span>
+          )}
+        </TabsTrigger>
+        <TabsTrigger value="timing">Timing</TabsTrigger>
+      </TabsList>
+
+      <TabsContent value="body" className="overflow-hidden">
+        <BodyTab response={response} requestId={requestId ?? null} />
+      </TabsContent>
+      <TabsContent value="headers" className="overflow-y-auto">
+        <HeadersTab headers={response.headers ?? []} />
+      </TabsContent>
+      <TabsContent value="cookies" className="overflow-y-auto">
+        <CookiesTab cookies={cookies} />
+      </TabsContent>
+      <TabsContent value="timing" className="overflow-y-auto">
+        <TimingTab timing={response.timing} />
+      </TabsContent>
+    </Tabs>
+  );
+}
+
+function BodyTab({ response, requestId }: { response: SendResponse; requestId: string | null }) {
   const [copied, setCopied] = useState(false);
+  const { open: openModal } = useModals();
+  const { data: pluginsData } = usePlugins();
+
+  const isImage = (response.bodyContentType ?? '').toLowerCase().startsWith('image/');
+  const canSaveBody = Boolean(response.bodyBase64 || response.bodyTempFile);
+
+  // Transformers from loaded plugins that match this response's content-type.
+  // An unset matchContentType means "any", so the entry shows up everywhere.
+  const transformers = useMemo(() => {
+    const all = pluginsData?.plugins.flatMap((p) => (p.error ? [] : p.transformers)) ?? [];
+    const ct = (response.bodyContentType ?? '').toLowerCase();
+    return all.filter(
+      (t) =>
+        !t.matchContentType ||
+        ct.includes((t.matchContentType ?? '').toLowerCase()),
+    );
+  }, [pluginsData, response.bodyContentType]);
+
+  // Active transformer + its output, if any.
+  const [transformerId, setTransformerId] = useState<string>('');
+  const [transformResult, setTransformResult] = useState<
+    | { ok: true; body: string; contentType: string | null; transformerName: string }
+    | { ok: false; error: string; transformerName: string }
+    | null
+  >(null);
+  const [transforming, setTransforming] = useState(false);
+
+  // Reset transformer state on body change (new request fired, etc.).
+  useEffect(() => {
+    setTransformerId('');
+    setTransformResult(null);
+  }, [response.bodyBase64, response.bodyContentType]);
+
+  const saveToFile = async () => {
+    const defaultName = suggestFilename(response.headers, response.bodyContentType);
+    try {
+      await voltApi['response:saveBody']({
+        defaultName,
+        contentBase64: response.bodyBase64 ?? null,
+        tempPath: response.bodyTempFile ?? null,
+      });
+    } catch (e) {
+      // Surface in console; the native dialog already gives the user feedback.
+      console.error('Failed to save response body', e);
+    }
+  };
+
+  const runTransformer = async (id: string, decodedText: string) => {
+    if (!id) {
+      setTransformerId('');
+      setTransformResult(null);
+      return;
+    }
+    const t = transformers.find((x) => x.id === id);
+    if (!t) return;
+    setTransformerId(id);
+    setTransforming(true);
+    try {
+      const headers: Record<string, string> = {};
+      for (const [k, v] of response.headers ?? []) headers[k] = v;
+      const out = await voltApi['plugins:applyTransformer']({
+        transformerId: id,
+        body: decodedText,
+        contentType: response.bodyContentType ?? null,
+        headers,
+      });
+      if (out.ok) {
+        setTransformResult({
+          ok: true,
+          body: out.body,
+          contentType: out.contentType,
+          transformerName: t.name,
+        });
+      } else {
+        setTransformResult({ ok: false, error: out.error, transformerName: t.name });
+      }
+    } finally {
+      setTransforming(false);
+    }
+  };
 
   // Decode body — first see if it's text-ish
   const { text, isBinary } = useMemo(
@@ -154,18 +262,67 @@ function BodyTab({ response }: { response: SendResponse }) {
     }
   }, [text, language]);
 
+  // If a transformer ran successfully, its output replaces the displayed body
+  // (and we re-derive the editor language from the transformer's content-type).
+  const displayedText =
+    transformResult && transformResult.ok ? transformResult.body : formattedText;
+  const displayedLanguage: 'json' | 'xml' | 'html' | 'javascript' | 'text' = useMemo(() => {
+    if (!transformResult || !transformResult.ok) return language;
+    const ct = (transformResult.contentType ?? '').toLowerCase();
+    if (ct.includes('json')) return 'json';
+    if (ct.includes('xml')) return 'xml';
+    if (ct.includes('html')) return 'html';
+    if (ct.includes('javascript')) return 'javascript';
+    return 'text';
+  }, [transformResult, language]);
+
+  // Image preview takes priority over the binary/temp-file branches so users
+  // see the image inline instead of a "binary content" placeholder.
+  if (isImage && response.bodyBase64) {
+    return (
+      <div className="flex h-full flex-col">
+        <div className="flex flex-1 items-center justify-center overflow-auto p-4">
+          <img
+            src={`data:${response.bodyContentType};base64,${response.bodyBase64}`}
+            alt="Response"
+            className="max-h-full max-w-full object-contain"
+          />
+        </div>
+        <div className="flex items-center justify-between gap-2 border-t border-border px-3 py-2 text-[10px] text-text-muted">
+          <span>
+            {response.bodyContentType} · {formatBytes(response.bodySizeBytes ?? 0)}
+          </span>
+          {canSaveBody && (
+            <SaveBodyButton onClick={saveToFile} />
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (isImage && response.bodyTempFile) {
+    return (
+      <div className="flex h-full items-center justify-center p-4 text-center">
+        <div>
+          <p className="text-xs text-text-muted">
+            Image too large to preview inline ({formatBytes(response.bodySizeBytes ?? 0)})
+          </p>
+          <p className="mt-1 font-mono text-[10px] text-text-muted">{response.bodyContentType}</p>
+          <SaveBodyButton onClick={saveToFile} className="mt-3" />
+        </div>
+      </div>
+    );
+  }
+
   if (isBinary) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-center">
         <div>
-          <p className="text-xs text-text-muted">Binary content — {formatBytes(response.bodySizeBytes ?? 0)}</p>
+          <p className="text-xs text-text-muted">
+            Binary content — {formatBytes(response.bodySizeBytes ?? 0)}
+          </p>
           <p className="mt-1 font-mono text-[10px] text-text-muted">{response.bodyContentType}</p>
-          {response.bodyTempFile && (
-            <Button variant="outline" size="sm" className="mt-3" onClick={() => navigator.clipboard.writeText(response.bodyTempFile!)}>
-              <Download size={12} />
-              Copy file path
-            </Button>
-          )}
+          {canSaveBody && <SaveBodyButton onClick={saveToFile} className="mt-3" />}
         </div>
       </div>
     );
@@ -175,8 +332,11 @@ function BodyTab({ response }: { response: SendResponse }) {
     return (
       <div className="flex h-full items-center justify-center p-4 text-center">
         <div>
-          <p className="text-xs text-text-muted">Response too large to display ({formatBytes(response.bodySizeBytes ?? 0)})</p>
+          <p className="text-xs text-text-muted">
+            Response too large to display ({formatBytes(response.bodySizeBytes ?? 0)})
+          </p>
           <p className="mt-1 font-mono text-[10px] text-text-muted">{response.bodyTempFile}</p>
+          <SaveBodyButton onClick={saveToFile} className="mt-3" />
         </div>
       </div>
     );
@@ -184,20 +344,90 @@ function BodyTab({ response }: { response: SendResponse }) {
 
   return (
     <div className="relative h-full">
-      <button
-        type="button"
-        onClick={async () => {
-          await navigator.clipboard.writeText(formattedText);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1500);
-        }}
-        className="absolute right-3 top-2 z-10 flex items-center gap-1 rounded bg-bg-elevated/80 px-2 py-1 text-[10px] text-text-muted hover:text-text"
-      >
-        {copied ? <Check size={11} className="text-success" /> : <Copy size={11} />}
-        {copied ? 'Copied' : 'Copy'}
-      </button>
-      <CodeEditor value={formattedText} language={language} readOnly className="h-full" />
+      <div className="absolute right-3 top-2 z-10 flex items-center gap-1">
+        {transformers.length > 0 && (
+          <div className="flex items-center gap-1 rounded bg-bg-elevated/80 px-1 py-0.5 text-[10px] text-text-muted">
+            <Puzzle size={11} className={transforming ? 'animate-pulse text-accent' : undefined} />
+            <select
+              value={transformerId}
+              onChange={(e) => runTransformer(e.target.value, formattedText)}
+              className="cursor-pointer appearance-none bg-transparent pr-1 text-[10px] text-text-muted outline-none hover:text-text"
+              title="Apply a plugin transformer to this response body"
+            >
+              <option value="">Transform…</option>
+              {transformers.map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+        {canSaveBody && (
+          <button
+            type="button"
+            onClick={saveToFile}
+            className="flex items-center gap-1 rounded bg-bg-elevated/80 px-2 py-1 text-[10px] text-text-muted hover:text-text"
+            title="Save response body to a file"
+          >
+            <Download size={11} />
+            Save
+          </button>
+        )}
+        {requestId && (
+          <button
+            type="button"
+            onClick={() => openModal({ kind: 'add-example', requestId })}
+            className="flex items-center gap-1 rounded bg-bg-elevated/80 px-2 py-1 text-[10px] text-text-muted hover:text-text"
+            title="Save this request + response as an example"
+          >
+            <FilePlus2 size={11} />
+            Save as example
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={async () => {
+            await navigator.clipboard.writeText(displayedText);
+            setCopied(true);
+            setTimeout(() => setCopied(false), 1500);
+          }}
+          className="flex items-center gap-1 rounded bg-bg-elevated/80 px-2 py-1 text-[10px] text-text-muted hover:text-text"
+        >
+          {copied ? <Check size={11} className="text-success" /> : <Copy size={11} />}
+          {copied ? 'Copied' : 'Copy'}
+        </button>
+      </div>
+      {transformResult && !transformResult.ok && (
+        <div className="absolute inset-x-3 top-10 z-10 rounded border border-error/30 bg-error/10 px-2 py-1 text-[11px] text-error">
+          {transformResult.transformerName}: {transformResult.error}
+        </div>
+      )}
+      {transformResult && transformResult.ok && (
+        <div className="absolute inset-x-3 top-10 z-10 rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[11px] text-accent">
+          Transformed by <span className="font-semibold">{transformResult.transformerName}</span> ·{' '}
+          {transformResult.contentType ?? 'no content-type'}
+        </div>
+      )}
+      <CodeEditor value={displayedText} language={displayedLanguage} readOnly className="h-full" />
     </div>
+  );
+}
+
+function SaveBodyButton({ onClick, className }: { onClick: () => void; className?: string }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'inline-flex items-center gap-1 rounded border border-border bg-bg-elevated px-2 py-1 text-[11px] text-text hover:bg-bg',
+        className,
+      )}
+      title="Save response body to a file"
+    >
+      <Download size={12} />
+      Save to file
+    </button>
   );
 }
 
@@ -211,6 +441,52 @@ function HeadersTab({ headers }: { headers: [string, string][] }) {
             <td className="px-3 py-1.5 font-mono text-text break-all">{v}</td>
           </tr>
         ))}
+      </tbody>
+    </table>
+  );
+}
+
+function CookiesTab({ cookies }: { cookies: ParsedCookie[] }) {
+  if (cookies.length === 0) {
+    return (
+      <p className="px-3 py-6 text-center text-xs text-text-muted">
+        No cookies set by this response.
+      </p>
+    );
+  }
+  return (
+    <table className="w-full text-xs">
+      <thead>
+        <tr className="border-b border-border bg-bg-elevated text-[10px] uppercase tracking-wide text-text-muted">
+          <th className="px-3 py-1.5 text-left font-semibold">Name</th>
+          <th className="px-3 py-1.5 text-left font-semibold">Value</th>
+          <th className="px-3 py-1.5 text-left font-semibold">Domain</th>
+          <th className="px-3 py-1.5 text-left font-semibold">Path</th>
+          <th className="px-3 py-1.5 text-left font-semibold">Expires</th>
+          <th className="px-3 py-1.5 text-left font-semibold">Flags</th>
+        </tr>
+      </thead>
+      <tbody>
+        {cookies.map((c, i) => {
+          const flags = [
+            c.httpOnly && 'HttpOnly',
+            c.secure && 'Secure',
+            c.sameSite && `SameSite=${c.sameSite}`,
+          ].filter(Boolean);
+          const expires = c.expires ?? (c.maxAge != null ? `Max-Age=${c.maxAge}` : '');
+          return (
+            <tr key={i} className="border-b border-border/40 align-top">
+              <td className="px-3 py-1.5 font-mono text-text">{c.name}</td>
+              <td className="px-3 py-1.5 font-mono text-text break-all">{c.value}</td>
+              <td className="px-3 py-1.5 font-mono text-text-muted">{c.domain ?? '—'}</td>
+              <td className="px-3 py-1.5 font-mono text-text-muted">{c.path ?? '—'}</td>
+              <td className="px-3 py-1.5 font-mono text-text-muted">{expires || '—'}</td>
+              <td className="px-3 py-1.5 font-mono text-text-muted">
+                {flags.length > 0 ? flags.join(' · ') : '—'}
+              </td>
+            </tr>
+          );
+        })}
       </tbody>
     </table>
   );

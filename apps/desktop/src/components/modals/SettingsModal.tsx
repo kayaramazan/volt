@@ -5,6 +5,8 @@ import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { useModals } from '@/stores/modals';
 import { useAppInfo, useAuthStatus, useSignOut } from '@/hooks/useData';
+import { useTheme, type ThemePref } from '@/stores/theme';
+import { Select } from '@/components/ui/Select';
 import { formatRelativeTime } from '@/lib/util';
 
 interface MeResponse {
@@ -113,6 +115,13 @@ export function SettingsModal() {
 
         <section>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">
+            Appearance
+          </h3>
+          <ThemePicker />
+        </section>
+
+        <section>
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">
             About
           </h3>
           <div className="space-y-1 rounded-md border border-border bg-bg p-3 text-xs text-text-muted">
@@ -149,5 +158,24 @@ export function SettingsModal() {
         )}
       </div>
     </Dialog>
+  );
+}
+
+function ThemePicker() {
+  const { pref, setPref } = useTheme();
+  return (
+    <div className="rounded-md border border-border bg-bg p-3">
+      <label className="mb-1 block text-xs text-text-muted">Theme</label>
+      <Select
+        value={pref}
+        onChange={(e) => setPref(e.target.value as ThemePref)}
+        options={[
+          { value: 'system', label: 'System' },
+          { value: 'dark', label: 'Dark' },
+          { value: 'light', label: 'Light' },
+        ]}
+        className="w-40"
+      />
+    </div>
   );
 }

@@ -52,6 +52,30 @@ export const BinaryBody = z.object({
   type: z.literal('binary'),
   filePath: z.string(), // absolute path on disk
 });
+export const GraphQLBody = z.object({
+  type: z.literal('graphql'),
+  query: z.string().default(''),
+  variables: z.string().default(''), // JSON string entered by the user
+  operationName: z.string().optional(),
+});
+// gRPC request — the request method/url/headers/auth from ApiRequest are
+// unused for gRPC; instead, `address` is the server target (host:port), the
+// proto file path is on disk (so we don't have to embed large .proto blobs
+// in JSON), and `service`/`method` pick which unary call to invoke. `message`
+// is a JSON-encoded representation of the request protobuf, deserialized by
+// proto-loader on the main process. `metadata` is per-call gRPC metadata,
+// analogous to HTTP headers.
+export const GrpcBody = z.object({
+  type: z.literal('grpc'),
+  address: z.string().default('localhost:50051'),
+  protoPath: z.string().default(''),
+  service: z.string().default(''),
+  method: z.string().default(''),
+  message: z.string().default('{}'),
+  metadata: z
+    .array(z.object({ id: z.string(), key: z.string(), value: z.string(), enabled: z.boolean().default(true) }))
+    .default([]),
+});
 export const NoBody = z.object({
   type: z.literal('none'),
 });
@@ -61,6 +85,8 @@ export const RequestBody = z.discriminatedUnion('type', [
   FormBody,
   UrlEncodedBody,
   BinaryBody,
+  GraphQLBody,
+  GrpcBody,
 ]);
 export type RequestBody = z.infer<typeof RequestBody>;
 
@@ -81,7 +107,36 @@ export const ApiKeyAuth = z.object({
   value: z.string(),
   placement: z.enum(['header', 'query']),
 });
-export const RequestAuth = z.discriminatedUnion('type', [NoAuth, BearerAuth, BasicAuth, ApiKeyAuth]);
+// OAuth 2.0 — a few common grants. The actual access token (and any refresh
+// token) is stored in the app_state KV under `oauth.<key>` so it survives
+// restarts. The auth config here only holds the issuer details + grant params.
+export const OAuth2Auth = z.object({
+  type: z.literal('oauth2'),
+  grant: z.enum(['client_credentials', 'password', 'authorization_code']),
+  tokenUrl: z.string().default(''),
+  // authorization_code only
+  authUrl: z.string().optional(),
+  redirectUri: z.string().optional(),
+  // common
+  clientId: z.string().default(''),
+  clientSecret: z.string().default(''),
+  scope: z.string().optional(),
+  // password grant only
+  username: z.string().optional(),
+  password: z.string().optional(),
+  // where the resolver will inject the access token (Authorization header by default)
+  headerPrefix: z.string().default('Bearer'),
+  // stable id used to look up persisted token in app_state
+  tokenCacheKey: z.string().default(''),
+});
+
+export const RequestAuth = z.discriminatedUnion('type', [
+  NoAuth,
+  BearerAuth,
+  BasicAuth,
+  ApiKeyAuth,
+  OAuth2Auth,
+]);
 export type RequestAuth = z.infer<typeof RequestAuth>;
 
 // ─────────────────────────────────────────────────────────
@@ -147,6 +202,12 @@ export const ResolvedRequest = z.object({
     z.object({ type: z.literal('form'), fields: z.array(z.object({ key: z.string(), kind: z.enum(['text', 'file']), value: z.string() })) }),
     z.object({ type: z.literal('urlencoded'), content: z.string() }),
     z.object({ type: z.literal('binary'), filePath: z.string() }),
+    z.object({
+      type: z.literal('graphql'),
+      query: z.string().default(''),
+      variables: z.string().default(''),
+      operationName: z.string().optional(),
+    }),
   ]),
   // Resolved auth merged into headers/url, so no separate auth field here.
   timeoutMs: z.number().int().min(0).default(60_000),

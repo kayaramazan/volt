@@ -10,9 +10,12 @@
 import { Agent, request as undiciRequest } from 'undici';
 import { RESPONSE_BODY_MAX_BYTES, type ResolvedRequest, type SendRequestOutput } from '@volt/shared';
 import { app } from 'electron';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+
+import { getAutoHeaders } from '../db/queries';
 
 // In-flight requests, keyed by inFlightId. Cancellable via AbortController.
 const inFlight = new Map<string, AbortController>();
@@ -66,6 +69,14 @@ export async function executeRequest(
     const headers: Record<string, string> = { ...req.headers };
     if (contentType && !headerHas(headers, 'content-type')) {
       headers['Content-Type'] = contentType;
+    }
+    // Merge enabled auto-headers — user-defined entries (already in `headers`)
+    // win on case-insensitive name match.
+    for (const h of getAutoHeaders()) {
+      if (!h.enabled || !h.key) continue;
+      if (headerHas(headers, h.key)) continue;
+      const value = resolveAutoValue(h.key, h.value, req.url);
+      if (value !== null) headers[h.key] = value;
     }
 
     // Mark TTFB time after we get the first byte of the response.
@@ -199,6 +210,27 @@ function serializeBody(req: ResolvedRequest): {
         contentType: 'application/octet-stream',
       };
     }
+    case 'graphql': {
+      // GraphQL is just HTTP under the hood — POST a JSON envelope with
+      // `query`, optional `variables`, optional `operationName`.
+      let vars: unknown = undefined;
+      const raw = (body as { variables?: string }).variables ?? '';
+      if (raw.trim()) {
+        try {
+          vars = JSON.parse(raw);
+        } catch {
+          throw new Error('GraphQL variables must be valid JSON.');
+        }
+      }
+      const payload: Record<string, unknown> = {
+        query: (body as { query?: string }).query ?? '',
+      };
+      if (vars !== undefined) payload.variables = vars;
+      if ((body as { operationName?: string }).operationName) {
+        payload.operationName = (body as { operationName?: string }).operationName;
+      }
+      return { body: JSON.stringify(payload), contentType: 'application/json' };
+    }
   }
 }
 
@@ -251,6 +283,28 @@ function pickHeader(headers: [string, string][], name: string): string | undefin
 function headerHas(headers: Record<string, string>, name: string): boolean {
   const lower = name.toLowerCase();
   return Object.keys(headers).some((k) => k.toLowerCase() === lower);
+}
+
+/**
+ * Resolve an auto-header value. Static values pass through; the sentinel
+ * `<auto>` is computed per-header name (Host from URL, Volt-Token = UUID).
+ * Returns null to suppress (e.g. Host with unparseable URL).
+ */
+function resolveAutoValue(name: string, template: string, url: string): string | null {
+  if (template !== '<auto>') return template;
+  const lower = name.toLowerCase();
+  if (lower === 'host') {
+    try {
+      const u = new URL(url);
+      return u.host; // host == hostname[:port]
+    } catch {
+      return null;
+    }
+  }
+  if (lower === 'volt-token') return randomUUID();
+  // Unknown <auto> placeholder — leave it as a fresh uuid as a useful default
+  // rather than failing the request.
+  return randomUUID();
 }
 
 function classifyError(err: unknown): { code: string; message: string } {

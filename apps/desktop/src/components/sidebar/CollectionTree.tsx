@@ -1,15 +1,16 @@
 import { createContext, useContext, useMemo, useState, type DragEvent, type MouseEvent } from 'react';
-import { BookText, ChevronRight, Copy, FolderPlus, Folder, FileText, FilePlus2, MoreHorizontal, Search, Trash2, X } from 'lucide-react';
+import { BookText, ChevronRight, Copy, Download, FileCode2, FolderPlus, Folder, FileText, FilePlus2, MoreHorizontal, Search, Server, Trash2, X } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
+import { useQueryClient } from '@tanstack/react-query';
 
 import { cn, methodColorClass } from '@/lib/util';
+import { voltApi } from '@/lib/volt-api';
 import {
   useCollections,
   useDeleteCollection,
   useDeleteRequest,
   useDuplicateRequest,
   useRequests,
-  useUpdateCollection,
   useUpdateRequest,
 } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
@@ -26,12 +27,27 @@ interface CollectionNode {
   sortOrder?: number;
 }
 
+interface ExampleSummary {
+  id: string;
+  name: string;
+  /** Captured response status code, if any (used for a small numeric chip). */
+  statusCode?: number;
+}
+
 interface RequestNode {
   id: string;
   name: string;
   method: string;
   collectionId: string | null;
   sortOrder?: number;
+  /** Discriminates gRPC requests from HTTP ones so the row can show "gRPC". */
+  body?: { type?: string };
+  /** Examples saved against this request, as returned by listRequests. */
+  examples?: Array<{
+    id: string;
+    name: string;
+    response?: { ok?: boolean; statusCode?: number } | null;
+  }>;
 }
 
 type DragPayload =
@@ -41,10 +57,26 @@ type DragPayload =
 interface TreeCtx {
   dragging: DragPayload | null;
   setDragging: (p: DragPayload | null) => void;
+  /** Drop a request into a folder (or root) — appends at the end. */
   moveRequest: (requestId: string, toCollectionId: string | null) => void;
   /** Returns true if moving `collectionId` under `newParentId` would create a cycle. */
   wouldCycle: (collectionId: string, newParentId: string | null) => boolean;
+  /** Drop a collection into a folder (or root) — appends at the end. */
   moveCollection: (collectionId: string, newParentId: string | null) => void;
+  /** Re-position a request relative to a target row. `side === 'above'`
+   *  drops the dragged item before the target, `'below'` after. The dragged
+   *  item inherits the target's parent collection. */
+  reorderRequestNear: (
+    requestId: string,
+    targetRequestId: string,
+    side: 'above' | 'below',
+  ) => void;
+  /** Same idea for collections — drop above/below another collection. */
+  reorderCollectionNear: (
+    collectionId: string,
+    targetCollectionId: string,
+    side: 'above' | 'below',
+  ) => void;
   /** When true, the tree is filtered to a search query (callers should force-expand). */
   searching: boolean;
   /** Collection ids that should render (own name matched OR has a matching descendant). */
@@ -70,9 +102,8 @@ const useTree = () => {
 export function CollectionTree({ workspaceId }: Props) {
   const { data: collections } = useCollections(workspaceId);
   const { data: requests } = useRequests(workspaceId);
+  const qc = useQueryClient();
   const { open: openModal } = useModals();
-  const updateRequest = useUpdateRequest();
-  const updateCollection = useUpdateCollection();
   const [dragging, setDragging] = useState<DragPayload | null>(null);
   const [rootDropActive, setRootDropActive] = useState(false);
   const [query, setQuery] = useState('');
@@ -154,10 +185,21 @@ export function CollectionTree({ workspaceId }: Props) {
       if (!current) return;
       if ((current.collectionId ?? null) === toCollectionId) return;
       const siblings = requestsByCollection.get(toCollectionId) ?? [];
-      updateRequest.mutate({
+      const newSortOrder = nextSortOrder(siblings);
+      // Optimistic write so the sidebar reorders before the IPC round-trip.
+      qc.setQueryData<RequestNode[]>(['requests', workspaceId, null], (prev) =>
+        prev?.map((r) =>
+          r.id === requestId
+            ? { ...r, collectionId: toCollectionId, sortOrder: newSortOrder }
+            : r,
+        ),
+      );
+      voltApi['apiRequest:update']({
         id: requestId,
         collectionId: toCollectionId,
-        sortOrder: nextSortOrder(siblings),
+        sortOrder: newSortOrder,
+      } as never).finally(() => {
+        qc.invalidateQueries({ queryKey: ['requests'] });
       });
     },
     wouldCycle: (collectionId, newParentId) => {
@@ -178,10 +220,164 @@ export function CollectionTree({ workspaceId }: Props) {
       if ((current.parentId ?? null) === newParentId) return;
       if (newParentId === collectionId) return;
       const siblings = collectionsByParent.get(newParentId) ?? [];
-      updateCollection.mutate({
+      const newSortOrder = nextCollectionSortOrder(siblings);
+      qc.setQueryData<CollectionNode[]>(['collections', workspaceId], (prev) =>
+        prev?.map((c) =>
+          c.id === collectionId
+            ? { ...c, parentId: newParentId, sortOrder: newSortOrder }
+            : c,
+        ),
+      );
+      voltApi['collection:update']({
         id: collectionId,
         parentId: newParentId,
-        sortOrder: nextCollectionSortOrder(siblings),
+        sortOrder: newSortOrder,
+      } as never).finally(() => {
+        qc.invalidateQueries({ queryKey: ['collections'] });
+      });
+    },
+    // Drop a request before/after another request. Renumbers siblings in
+    // the target parent + writes a new sortOrder per row. Uses an
+    // optimistic React Query cache write so the sidebar redraws instantly;
+    // the actual DB writes happen via direct IPC calls (bypassing
+    // useUpdateRequest so we don't trigger N invalidations).
+    reorderRequestNear: (requestId, targetRequestId, side) => {
+      if (requestId === targetRequestId) return;
+      const all = (requests ?? []) as RequestNode[];
+      const draggedRow = all.find((r) => r.id === requestId);
+      const targetRow = all.find((r) => r.id === targetRequestId);
+      if (!draggedRow || !targetRow) return;
+      const toCollectionId = targetRow.collectionId ?? null;
+      const allInParent = all
+        .filter((r) => (r.collectionId ?? null) === toCollectionId)
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+      const without = allInParent.filter((r) => r.id !== requestId);
+      const targetIndex = without.findIndex((r) => r.id === targetRequestId);
+      if (targetIndex < 0) return;
+      const insertIndex = side === 'above' ? targetIndex : targetIndex + 1;
+      const next: Array<RequestNode | null> = [
+        ...without.slice(0, insertIndex),
+        null,
+        ...without.slice(insertIndex),
+      ];
+      const updates: Array<{ id: string; sortOrder: number; collectionId?: string | null }> = [];
+      next.forEach((r, i) => {
+        if (r === null) {
+          const needsParentChange =
+            (draggedRow.collectionId ?? null) !== toCollectionId;
+          const needsOrderChange = (draggedRow.sortOrder ?? 0) !== i;
+          if (needsParentChange || needsOrderChange) {
+            updates.push({
+              id: requestId,
+              sortOrder: i,
+              ...(needsParentChange ? { collectionId: toCollectionId } : {}),
+            });
+          }
+        } else if ((r.sortOrder ?? 0) !== i) {
+          updates.push({ id: r.id, sortOrder: i });
+        }
+      });
+      if (updates.length === 0) return;
+
+      // Optimistic cache write — the sidebar re-renders instantly with the
+      // new order. The reconciliation invalidation at the end will
+      // overwrite this with whatever the DB returns.
+      qc.setQueryData<RequestNode[]>(['requests', workspaceId, null], (prev) => {
+        if (!prev) return prev;
+        const byId = new Map(updates.map((u) => [u.id, u] as const));
+        return prev.map((row) => {
+          const u = byId.get(row.id);
+          if (!u) return row;
+          return {
+            ...row,
+            sortOrder: u.sortOrder,
+            ...(u.collectionId !== undefined ? { collectionId: u.collectionId } : {}),
+          };
+        });
+      });
+
+      // Background writes — direct IPC (no React Query mutation hook = no
+      // per-write invalidations). One invalidation at the end reconciles.
+      void Promise.all(
+        updates.map((u) =>
+          voltApi['apiRequest:update']({
+            id: u.id,
+            ...(u.collectionId !== undefined ? { collectionId: u.collectionId } : {}),
+            sortOrder: u.sortOrder,
+          } as never),
+        ),
+      ).finally(() => {
+        qc.invalidateQueries({ queryKey: ['requests'] });
+      });
+    },
+    reorderCollectionNear: (collectionId, targetCollectionId, side) => {
+      if (collectionId === targetCollectionId) return;
+      const all = (collections ?? []) as CollectionNode[];
+      const draggedRow = all.find((c) => c.id === collectionId);
+      const targetRow = all.find((c) => c.id === targetCollectionId);
+      if (!draggedRow || !targetRow) return;
+      const toParentId = targetRow.parentId ?? null;
+      // Cycle guard: a collection can't become its own descendant.
+      let cursor: string | null = toParentId;
+      while (cursor) {
+        if (cursor === collectionId) return;
+        const parent = all.find((c) => c.id === cursor);
+        cursor = parent?.parentId ?? null;
+      }
+      const allInParent = all
+        .filter((c) => (c.parentId ?? null) === toParentId)
+        .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
+      const without = allInParent.filter((c) => c.id !== collectionId);
+      const targetIndex = without.findIndex((c) => c.id === targetCollectionId);
+      if (targetIndex < 0) return;
+      const insertIndex = side === 'above' ? targetIndex : targetIndex + 1;
+      const next: Array<CollectionNode | null> = [
+        ...without.slice(0, insertIndex),
+        null,
+        ...without.slice(insertIndex),
+      ];
+      const updates: Array<{ id: string; sortOrder: number; parentId?: string | null }> = [];
+      next.forEach((c, i) => {
+        if (c === null) {
+          const needsParentChange = (draggedRow.parentId ?? null) !== toParentId;
+          const needsOrderChange = (draggedRow.sortOrder ?? 0) !== i;
+          if (needsParentChange || needsOrderChange) {
+            updates.push({
+              id: collectionId,
+              sortOrder: i,
+              ...(needsParentChange ? { parentId: toParentId } : {}),
+            });
+          }
+        } else if ((c.sortOrder ?? 0) !== i) {
+          updates.push({ id: c.id, sortOrder: i });
+        }
+      });
+      if (updates.length === 0) return;
+
+      qc.setQueryData<CollectionNode[]>(['collections', workspaceId], (prev) => {
+        if (!prev) return prev;
+        const byId = new Map(updates.map((u) => [u.id, u] as const));
+        return prev.map((row) => {
+          const u = byId.get(row.id);
+          if (!u) return row;
+          return {
+            ...row,
+            sortOrder: u.sortOrder,
+            ...(u.parentId !== undefined ? { parentId: u.parentId } : {}),
+          };
+        });
+      });
+
+      void Promise.all(
+        updates.map((u) =>
+          voltApi['collection:update']({
+            id: u.id,
+            ...(u.parentId !== undefined ? { parentId: u.parentId } : {}),
+            sortOrder: u.sortOrder,
+          } as never),
+        ),
+      ).finally(() => {
+        qc.invalidateQueries({ queryKey: ['collections'] });
       });
     },
     searching,
@@ -295,7 +491,10 @@ function CollectionItem({
   requestsByCollection: Map<string | null, RequestNode[]>;
 }) {
   const [open, setOpen] = useState(depth < 1);
-  const [dropActive, setDropActive] = useState(false);
+  // Drop zone within this folder row: 'above' = insert before this folder,
+  // 'into' = move dragged item into this folder (existing behavior),
+  // 'below' = insert after this folder.
+  const [dropZone, setDropZone] = useState<'above' | 'into' | 'below' | null>(null);
   const { open: openModal } = useModals();
   const deleteCollection = useDeleteCollection();
   const tree = useTree();
@@ -311,38 +510,55 @@ function CollectionItem({
     : allChildRequests;
   const expanded = tree.searching ? true : open;
 
-  // Can this folder accept the currently dragged item?
-  const acceptsDrop =
-    tree.dragging &&
-    !(tree.dragging.kind === 'collection' && tree.dragging.id === collection.id) &&
-    !(tree.dragging.kind === 'collection' && tree.wouldCycle(tree.dragging.id, collection.id));
-
   function handleDragStart(e: DragEvent) {
     e.stopPropagation();
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', `collection:${collection.id}`);
     tree.setDragging({ kind: 'collection', id: collection.id });
   }
+
+  // Compute which of the three zones the mouse is currently in. Returns
+  // null when the row refuses the drop (self, would-cycle, etc.).
+  function computeDropZone(clientY: number, rect: DOMRect): 'above' | 'into' | 'below' | null {
+    const drag = tree.dragging;
+    if (!drag) return null;
+    const yFrac = (clientY - rect.top) / rect.height;
+    if (drag.kind === 'collection') {
+      if (drag.id === collection.id) return null;
+      if (yFrac < 0.25) return 'above';
+      if (yFrac > 0.75) return 'below';
+      return tree.wouldCycle(drag.id, collection.id) ? null : 'into';
+    }
+    // Request being dragged: only "into" makes sense for a folder row.
+    return 'into';
+  }
+
   function handleDragOver(e: DragEvent) {
-    if (!acceptsDrop) return;
+    if (!tree.dragging) return;
+    const zone = computeDropZone(e.clientY, e.currentTarget.getBoundingClientRect());
+    if (!zone) return;
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = 'move';
-    setDropActive(true);
+    setDropZone(zone);
   }
   function handleDrop(e: DragEvent) {
-    if (!acceptsDrop) return;
+    const zone = dropZone;
+    setDropZone(null);
+    if (!tree.dragging || !zone) return;
     e.preventDefault();
     e.stopPropagation();
-    setDropActive(false);
-    if (!tree.dragging) return;
-    if (tree.dragging.kind === 'request') {
-      tree.moveRequest(tree.dragging.id, collection.id);
-    } else {
-      tree.moveCollection(tree.dragging.id, collection.id);
-    }
+    const drag = tree.dragging;
     tree.setDragging(null);
-    setOpen(true); // open folder so user sees the moved item land
+    if (zone === 'into') {
+      if (drag.kind === 'request') tree.moveRequest(drag.id, collection.id);
+      else tree.moveCollection(drag.id, collection.id);
+      setOpen(true); // open the folder so user sees the moved item land
+      return;
+    }
+    // above/below — drop this collection above/below the target row.
+    if (drag.kind !== 'collection') return;
+    tree.reorderCollectionNear(drag.id, collection.id, zone);
   }
 
   return (
@@ -351,17 +567,24 @@ function CollectionItem({
         draggable
         onDragStart={handleDragStart}
         onDragOver={handleDragOver}
-        onDragLeave={() => setDropActive(false)}
+        onDragLeave={() => setDropZone(null)}
         onDrop={handleDrop}
         className={cn(
-          'group flex items-center justify-between rounded px-1.5 py-1 hover:bg-bg-elevated',
-          dropActive && 'bg-accent/10 ring-1 ring-accent/40',
+          'group relative flex items-center justify-between rounded px-1.5 py-1 hover:bg-bg-elevated',
+          dropZone === 'into' && 'bg-accent/10 ring-1 ring-accent/40',
           tree.dragging?.kind === 'collection' &&
             tree.dragging.id === collection.id &&
             'opacity-40',
         )}
         style={{ paddingLeft: `${depth * 12 + 6}px` }}
       >
+        {/* Insertion line for above/below — absolute so it doesn't shift layout. */}
+        {dropZone === 'above' && (
+          <span className="pointer-events-none absolute inset-x-1 -top-px h-0.5 rounded-full bg-accent" />
+        )}
+        {dropZone === 'below' && (
+          <span className="pointer-events-none absolute inset-x-1 -bottom-px h-0.5 rounded-full bg-accent" />
+        )}
         <button
           type="button"
           onClick={() => setOpen(!open)}
@@ -392,6 +615,22 @@ function CollectionItem({
               icon: <BookText size={13} />,
               onClick: () =>
                 openModal({ kind: 'collection-docs', collectionId: collection.id }),
+            },
+            {
+              label: 'Mocks…',
+              icon: <Server size={13} />,
+              onClick: () =>
+                openModal({ kind: 'collection-mocks', collectionId: collection.id }),
+            },
+            {
+              label: 'Export…',
+              icon: <Download size={13} />,
+              onClick: () =>
+                openModal({
+                  kind: 'export-collection',
+                  collectionId: collection.id,
+                  collectionName: collection.name,
+                }),
             },
             {
               label: 'Delete',
@@ -431,7 +670,7 @@ function RequestItem({
   request,
   depth,
 }: {
-  request: { id: string; name: string; method: string };
+  request: RequestNode;
   depth: number;
 }) {
   const { requestId, selectRequest } = useSelection();
@@ -441,6 +680,14 @@ function RequestItem({
   const active = requestId === request.id;
   const tree = useTree();
   const beingDragged = tree.dragging?.kind === 'request' && tree.dragging.id === request.id;
+  const examples = request.examples ?? [];
+  const hasExamples = examples.length > 0;
+  // Local expand state; force open while searching so any matched descendant
+  // is reachable. Default collapsed so existing requests don't reflow.
+  const [open, setOpen] = useState(false);
+  // 'above' / 'below' — request rows are leaves so there's no "into".
+  const [dropZone, setDropZone] = useState<'above' | 'below' | null>(null);
+  const expanded = tree.searching ? true : open;
 
   function handleDragStart(e: DragEvent) {
     e.stopPropagation();
@@ -449,54 +696,206 @@ function RequestItem({
     tree.setDragging({ kind: 'request', id: request.id });
   }
 
+  function handleDragOver(e: DragEvent) {
+    const drag = tree.dragging;
+    // Only request → request reorder makes sense on a request row. A
+    // dragged collection should land on a collection or root.
+    if (!drag || drag.kind !== 'request' || drag.id === request.id) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = 'move';
+    const rect = e.currentTarget.getBoundingClientRect();
+    setDropZone(e.clientY < rect.top + rect.height / 2 ? 'above' : 'below');
+  }
+  function handleDrop(e: DragEvent) {
+    const zone = dropZone;
+    setDropZone(null);
+    const drag = tree.dragging;
+    if (!drag || drag.kind !== 'request' || !zone) return;
+    e.preventDefault();
+    e.stopPropagation();
+    tree.setDragging(null);
+    tree.reorderRequestNear(drag.id, request.id, zone);
+  }
+
+  // Build the summary list once per render; cheap, examples are small.
+  const exampleSummaries: ExampleSummary[] = examples.map((e) => ({
+    id: e.id,
+    name: e.name,
+    statusCode: e.response?.ok ? e.response.statusCode : undefined,
+  }));
+
+  return (
+    <div onDragEnd={() => tree.setDragging(null)}>
+      <div
+        draggable
+        onDragStart={handleDragStart}
+        onDragOver={handleDragOver}
+        onDragLeave={() => setDropZone(null)}
+        onDrop={handleDrop}
+        className={cn(
+          'group relative flex items-center justify-between rounded px-1.5 py-1 hover:bg-bg-elevated',
+          active && 'bg-bg-elevated',
+          beingDragged && 'opacity-40',
+        )}
+        style={{ paddingLeft: `${depth * 12 + 6}px` }}
+      >
+        {dropZone === 'above' && (
+          <span className="pointer-events-none absolute inset-x-1 -top-px h-0.5 rounded-full bg-accent" />
+        )}
+        {dropZone === 'below' && (
+          <span className="pointer-events-none absolute inset-x-1 -bottom-px h-0.5 rounded-full bg-accent" />
+        )}
+        {/* Chevron column — always rendered (even when empty) so request rows
+            align horizontally regardless of whether they have examples. */}
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            if (hasExamples) setOpen(!open);
+          }}
+          className={cn(
+            'mr-0.5 flex h-4 w-4 items-center justify-center rounded text-text-muted',
+            hasExamples ? 'hover:bg-bg' : 'invisible',
+          )}
+          tabIndex={hasExamples ? 0 : -1}
+          aria-label={expanded ? 'Collapse examples' : 'Expand examples'}
+        >
+          <ChevronRight
+            size={11}
+            className={cn('transition-transform', expanded && 'rotate-90')}
+          />
+        </button>
+
+        <button
+          type="button"
+          onClick={() => selectRequest(request.id)}
+          className="flex flex-1 items-center gap-2 truncate text-left text-13"
+        >
+          {request.body?.type === 'grpc' ? (
+            <span className="font-mono text-[10px] font-semibold text-accent">gRPC</span>
+          ) : (
+            <span className={cn('font-mono text-[10px] font-semibold', methodColorClass(request.method))}>
+              {request.method.slice(0, 4)}
+            </span>
+          )}
+          <span className="truncate text-text">{request.name}</span>
+          {hasExamples && (
+            <span className="ml-1 text-[10px] text-text-muted">{examples.length}</span>
+          )}
+        </button>
+
+        <ItemMenu
+          actions={[
+            {
+              label: 'Duplicate',
+              icon: <Copy size={13} />,
+              onClick: () => duplicate.mutate(request.id),
+            },
+            {
+              label: 'Documentation',
+              icon: <BookText size={13} />,
+              onClick: () => openModal({ kind: 'request-docs', requestId: request.id }),
+            },
+            {
+              label: 'Add example',
+              icon: <FilePlus2 size={13} />,
+              onClick: () => openModal({ kind: 'add-example', requestId: request.id }),
+            },
+            {
+              label: 'Delete',
+              icon: <Trash2 size={13} />,
+              destructive: true,
+              onClick: () => {
+                if (confirm(`Delete "${request.name}"?`)) {
+                  deleteRequest.mutate(request.id);
+                }
+              },
+            },
+          ]}
+        />
+      </div>
+
+      {expanded && hasExamples && (
+        <div>
+          {exampleSummaries.map((ex) => (
+            <ExampleItem
+              key={ex.id}
+              requestId={request.id}
+              example={ex}
+              depth={depth + 1}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ExampleItem({
+  requestId,
+  example,
+  depth,
+}: {
+  requestId: string;
+  example: ExampleSummary;
+  depth: number;
+}) {
+  const {
+    requestId: activeRequestId,
+    selectedExampleId,
+    selectExample,
+    setSelectedExampleId,
+  } = useSelection();
+  const updateRequest = useUpdateRequest();
+  const qc = useQueryClient();
+  const active = activeRequestId === requestId && selectedExampleId === example.id;
+
   return (
     <div
-      draggable
-      onDragStart={handleDragStart}
-      onDragEnd={() => tree.setDragging(null)}
       className={cn(
-        'group flex items-center justify-between rounded px-1.5 py-1 hover:bg-bg-elevated',
-        active && 'bg-bg-elevated',
-        beingDragged && 'opacity-40',
+        'group flex items-center justify-between gap-1.5 rounded px-1.5 py-1 text-xs hover:bg-bg-elevated',
+        active && 'bg-bg-elevated text-text',
+        !active && 'text-text-muted',
       )}
-      style={{ paddingLeft: `${depth * 12 + 24}px` }}
+      style={{ paddingLeft: `${depth * 12 + 30}px` }}
     >
       <button
         type="button"
-        onClick={() => selectRequest(request.id)}
-        className="flex flex-1 items-center gap-2 truncate text-left text-13"
+        onClick={() => selectExample(requestId, example.id)}
+        className="flex flex-1 items-center gap-2 truncate text-left"
+        title={example.name}
       >
-        <span className={cn('font-mono text-[10px] font-semibold', methodColorClass(request.method))}>
-          {request.method.slice(0, 4)}
-        </span>
-        <span className="truncate text-text">{request.name}</span>
+        <FileCode2 size={11} className="flex-shrink-0" />
+        <span className="truncate">{example.name}</span>
+        {example.statusCode != null && (
+          <span className="ml-1 font-mono text-[10px] text-text-muted">
+            {example.statusCode}
+          </span>
+        )}
       </button>
 
       <ItemMenu
         actions={[
           {
-            label: 'Duplicate',
-            icon: <Copy size={13} />,
-            onClick: () => duplicate.mutate(request.id),
-          },
-          {
-            label: 'Documentation',
-            icon: <BookText size={13} />,
-            onClick: () => openModal({ kind: 'request-docs', requestId: request.id }),
-          },
-          {
-            label: 'Add example',
-            icon: <FilePlus2 size={13} />,
-            onClick: () => openModal({ kind: 'add-example', requestId: request.id }),
-          },
-          {
             label: 'Delete',
             icon: <Trash2 size={13} />,
             destructive: true,
             onClick: () => {
-              if (confirm(`Delete "${request.name}"?`)) {
-                deleteRequest.mutate(request.id);
-              }
+              if (!confirm(`Delete example "${example.name}"?`)) return;
+              // Read from the React Query cache so we pick up any pending
+              // edits to other examples (e.g. an auto-save in flight) instead
+              // of stale data from the list query.
+              const current = qc.getQueryData<{ examples?: Array<{ id: string }> }>([
+                'request',
+                requestId,
+              ]);
+              const examples = (current?.examples ?? []) as Array<{ id: string }>;
+              updateRequest.mutate({
+                id: requestId,
+                examples: examples.filter((e) => e.id !== example.id) as never,
+              });
+              if (selectedExampleId === example.id) setSelectedExampleId(null);
             },
           },
         ]}

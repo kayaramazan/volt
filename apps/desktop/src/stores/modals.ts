@@ -16,7 +16,26 @@ type ModalKind =
   | { kind: 'globals' }
   | { kind: 'collection-docs'; collectionId: string }
   | { kind: 'request-docs'; requestId: string }
-  | { kind: 'add-example'; requestId: string };
+  | { kind: 'add-example'; requestId: string }
+  | { kind: 'export-collection'; collectionId: string; collectionName: string }
+  | { kind: 'global-search' }
+  | { kind: 'response-diff'; leftId: string; rightId: string }
+  | { kind: 'websocket' }
+  | { kind: 'chain'; chainId?: string }
+  | { kind: 'collection-mocks'; collectionId: string }
+  | { kind: 'mock-settings' }
+  | { kind: 'plugins' }
+  | { kind: 'conflicts'; workspaceId: string }
+  | {
+      kind: 'codegen';
+      title: string;
+      request: {
+        method: string;
+        url: string;
+        headers: Record<string, string>;
+        body: unknown;
+      };
+    };
 
 interface ModalState {
   current: ModalKind;

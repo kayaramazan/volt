@@ -75,6 +75,8 @@ export const collections = sqliteTable(
     sortOrder: integer('sort_order').notNull().default(0),
     // JSON: Variable[] (key, value, secretRef)
     variables: text('variables').notNull().default('[]'),
+    // JSON: MockDefinition[] — local mock-server entries scoped to this collection.
+    mocks: text('mocks').notNull().default('[]'),
     // Sync tracking
     dirty: integer('dirty', { mode: 'boolean' }).notNull().default(false),
     remoteRevision: text('remote_revision').notNull().default('0'),

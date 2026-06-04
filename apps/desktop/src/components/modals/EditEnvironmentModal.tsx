@@ -52,8 +52,9 @@ export function EditEnvironmentModal() {
       setSelectedId(requestedId);
       return;
     }
-    if (environments && environments.length > 0) {
-      setSelectedId(environments[0].id);
+    const first = environments?.[0];
+    if (first) {
+      setSelectedId(first.id);
     } else {
       setSelectedId(GLOBALS_TAB);
     }

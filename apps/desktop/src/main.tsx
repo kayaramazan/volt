@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 
 import { App } from './App';
+import './stores/theme'; // initializes <html class="light|dark"> on load
 import './styles/global.css';
 
 const queryClient = new QueryClient({

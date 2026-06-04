@@ -1,0 +1,27 @@
+{
+  "name": "@volt/cli",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Volt CLI — send saved requests from the same volt.db the desktop app uses.",
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "bin": {
+    "volt": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && chmod +x dist/index.js",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'noop'"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "undici": "^6.20.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

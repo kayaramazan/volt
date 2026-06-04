@@ -20,7 +20,9 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn', 'log'],
     bodyParser: true,
-    // raw body for potential webhook later — disabled for now
+    // Raw body required for Stripe webhook signature verification —
+    // BillingController reads `req.rawBody` for /api/webhooks/stripe.
+    rawBody: true,
   });
 
   app.use(

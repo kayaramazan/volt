@@ -23,6 +23,7 @@ import {
   deleteGlobal,
   deleteWorkspaceLocal,
   getActiveEnvironment,
+  getAutoHeaders,
   getEnvironment,
   getHistoryEntry,
   getRequest,
@@ -35,6 +36,7 @@ import {
   recordHistory,
   renameWorkspace,
   setActiveEnvironment,
+  setAutoHeaders,
   setGlobal,
   softDeleteCollection,
   softDeleteEnvironment,
@@ -43,11 +45,36 @@ import {
   updateEnvironment,
   updateRequest,
   clearHistory,
+  listActiveConflicts,
+  dismissConflict,
+  getConflictById,
 } from '../core/db/queries';
 import { getDbPath } from '../core/db/connection';
 import { getSecret } from '../core/auth/keychain';
 import { authedFetch, currentUser, login as authLogin, logout as authLogout, register as authRegister } from '../core/auth/manager';
 import { executeRequest, cancelRequest } from '../core/http/engine';
+import { wsClose, wsOpen, wsSend } from '../core/http/ws';
+import {
+  invokeUnary,
+  loadProto,
+  openStream as grpcOpenStream,
+  streamClose as grpcStreamClose,
+  streamHalfClose as grpcStreamHalfClose,
+  streamSend as grpcStreamSend,
+} from '../core/grpc/engine';
+import { getMockStatus, startMockServer, stopMockServer } from '../core/mock/server';
+import {
+  applyTransformer,
+  ensurePluginsFolder,
+  listPlugins,
+  loadAllPlugins,
+  pluginsDir,
+} from '../core/plugins/runtime';
+import {
+  buildAuthCodeUrl,
+  ensureToken,
+  exchangeAuthCode,
+} from '../core/auth/oauth';
 import {
   runPostResponse,
   runPreRequest,
@@ -60,6 +87,11 @@ import { importPostman } from '../core/import/postman';
 import { importInsomnia } from '../core/import/insomnia';
 import { importOpenAPI } from '../core/import/openapi';
 import { importCurl } from '../core/import/curl';
+import { importHar } from '../core/import/har';
+import { exportPostman } from '../core/export/postman';
+import { exportInsomnia } from '../core/export/insomnia';
+import { exportOpenAPI } from '../core/export/openapi';
+import { exportDocs } from '../core/export/docs';
 
 export function registerIpcHandlers() {
   // Generic handler wrapper: validates input via contract, catches errors.
@@ -203,8 +235,8 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
                 : null,
             responseSizeBytes: output.ok ? output.bodySizeBytes : null,
             responseContentType: output.ok ? output.bodyContentType : null,
-            startedAt: Date.now() - output.timing.totalMs,
-            durationMs: output.timing.totalMs,
+            startedAt: Date.now() - (output.timing?.totalMs ?? 0),
+            durationMs: output.timing?.totalMs ?? 0,
             errorCode: output.ok ? null : output.errorCode,
           });
         }
@@ -214,9 +246,121 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
 
       return { ...output, preScript: preScriptOutput, postScript: postScriptOutput };
     }
+    case 'ws:open': {
+      const { url } = input as { url: string };
+      return wsOpen(url);
+    }
+    case 'ws:send': {
+      const { connectionId, text } = input as { connectionId: string; text: string };
+      return wsSend(connectionId, text);
+    }
+    case 'ws:close': {
+      const { connectionId } = input as { connectionId: string };
+      return wsClose(connectionId);
+    }
+    case 'grpc:loadProto': {
+      const { protoPath } = input as { protoPath: string };
+      return loadProto(protoPath);
+    }
+    case 'grpc:invoke': {
+      return invokeUnary(
+        input as {
+          address: string;
+          protoPath: string;
+          service: string;
+          method: string;
+          message: string;
+          metadata?: Record<string, string>;
+          timeoutMs?: number;
+        },
+      );
+    }
+    case 'grpc:openStream': {
+      return grpcOpenStream(
+        input as {
+          address: string;
+          protoPath: string;
+          service: string;
+          method: string;
+          message?: string;
+          metadata?: Record<string, string>;
+        },
+      );
+    }
+    case 'grpc:streamSend': {
+      const { connectionId, message } = input as { connectionId: string; message: string };
+      return grpcStreamSend(connectionId, message);
+    }
+    case 'grpc:streamHalfClose': {
+      const { connectionId } = input as { connectionId: string };
+      return grpcStreamHalfClose(connectionId);
+    }
+    case 'grpc:streamClose': {
+      const { connectionId } = input as { connectionId: string };
+      return grpcStreamClose(connectionId);
+    }
+    case 'mock:status': {
+      return getMockStatus();
+    }
+    case 'mock:start': {
+      const { port } = input as { port?: number };
+      return startMockServer(port);
+    }
+    case 'mock:stop': {
+      return stopMockServer();
+    }
+    case 'plugins:list': {
+      return { plugins: listPlugins(), dir: pluginsDir() };
+    }
+    case 'plugins:reload': {
+      const result = loadAllPlugins();
+      return { ...result, plugins: listPlugins() };
+    }
+    case 'plugins:openFolder': {
+      const dir = ensurePluginsFolder();
+      void shell.openPath(dir);
+      return { ok: true, dir };
+    }
+    case 'plugins:applyTransformer': {
+      return applyTransformer(
+        input as {
+          transformerId: string;
+          body: string;
+          contentType: string | null;
+          headers?: Record<string, string>;
+        },
+      );
+    }
     case 'request:cancel': {
       const { inFlightId } = input as { inFlightId: string };
       return { cancelled: cancelRequest(inFlightId) };
+    }
+    case 'response:saveBody': {
+      const { defaultName, contentBase64, tempPath } = input as {
+        defaultName: string;
+        contentBase64?: string | null;
+        tempPath?: string | null;
+      };
+      try {
+        const window = BrowserWindow.getFocusedWindow();
+        const save = await dialog.showSaveDialog(window ?? undefined!, {
+          title: 'Save response',
+          defaultPath: defaultName,
+        });
+        if (save.canceled || !save.filePath) {
+          return { success: false, cancelled: true };
+        }
+        if (contentBase64) {
+          fs.writeFileSync(save.filePath, Buffer.from(contentBase64, 'base64'));
+        } else if (tempPath) {
+          fs.copyFileSync(tempPath, save.filePath);
+        } else {
+          return { success: false, errorMessage: 'No response body to save.' };
+        }
+        return { success: true, path: save.filePath };
+      } catch (e) {
+        return { success: false, errorMessage: (e as Error).message };
+      }
     }
 
     // ──── Workspaces
@@ -278,6 +422,39 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       softDeleteCollection(id);
       notifyDirty();
       return { deleted: true };
+    }
+    case 'collection:export': {
+      const { workspaceId, collectionId, format } = input as {
+        workspaceId: string;
+        collectionId?: string;
+        format: 'postman' | 'insomnia' | 'openapi' | 'markdown';
+      };
+      try {
+        const { content, filename } =
+          format === 'postman'
+            ? exportPostman(workspaceId, collectionId ?? null)
+            : format === 'insomnia'
+              ? exportInsomnia(workspaceId, collectionId ?? null)
+              : format === 'openapi'
+                ? exportOpenAPI(workspaceId, collectionId ?? null)
+                : exportDocs(workspaceId, collectionId ?? null);
+        const window = BrowserWindow.getFocusedWindow();
+        const isMd = format === 'markdown';
+        const save = await dialog.showSaveDialog(window ?? undefined!, {
+          title: `Export as ${format}`,
+          defaultPath: filename,
+          filters: isMd
+            ? [{ name: 'Markdown', extensions: ['md'] }]
+            : [{ name: 'JSON', extensions: ['json'] }],
+        });
+        if (save.canceled || !save.filePath) {
+          return { success: false, cancelled: true };
+        }
+        fs.writeFileSync(save.filePath, content, 'utf-8');
+        return { success: true, path: save.filePath };
+      } catch (e) {
+        return { success: false, errorMessage: (e as Error).message };
+      }
     }
 
     // ──── Requests
@@ -442,6 +619,31 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       const { code } = input as { code: string };
       return teamApi('POST', `/api/teams/invite/${encodeURIComponent(code)}/accept`);
     }
+    case 'team:billing': {
+      const { teamId } = input as { teamId: string };
+      return teamApi('GET', `/api/teams/${teamId}/billing`);
+    }
+    case 'team:billingCheckout': {
+      const { teamId } = input as { teamId: string };
+      const result = await teamApi('POST', `/api/teams/${teamId}/billing/checkout`);
+      // Convenience: open the Stripe checkout page directly so the user
+      // doesn't have to manually copy-paste a URL out of the modal.
+      const url = (result as { url?: string })?.url;
+      if (url) void shell.openExternal(url);
+      return result;
+    }
+    case 'team:billingPortal': {
+      const { teamId } = input as { teamId: string };
+      const result = await teamApi('POST', `/api/teams/${teamId}/billing/portal`);
+      const url = (result as { url?: string })?.url;
+      if (url) void shell.openExternal(url);
+      return result;
+    }
+    case 'team:auditLog': {
+      const { teamId, limit } = input as { teamId: string; limit?: number };
+      const q = limit ? `?limit=${limit}` : '';
+      return teamApi('GET', `/api/teams/${teamId}/audit-log${q}`);
+    }
 
     // ──── Globals (per-device key/value, settable from scripts)
     case 'globals:list':
@@ -457,6 +659,44 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       return { ok: true as const };
     }
 
+    case 'oauth:ensureToken': {
+      const cfg = input as Parameters<typeof ensureToken>[0];
+      try {
+        const t = await ensureToken(cfg);
+        if (!t) return { ok: false, error: 'No token; complete the auth-code flow first.' };
+        return {
+          ok: true,
+          accessToken: t.accessToken,
+          tokenType: t.tokenType,
+          expiresAt: t.expiresAt,
+        };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    }
+    case 'oauth:getAuthUrl': {
+      const cfg = input as Parameters<typeof buildAuthCodeUrl>[0];
+      return buildAuthCodeUrl(cfg);
+    }
+    case 'oauth:exchangeCode': {
+      const cfg = input as Parameters<typeof exchangeAuthCode>[0] & { code: string; verifier: string };
+      try {
+        const t = await exchangeAuthCode(cfg, cfg.code, cfg.verifier);
+        if (!t) return { ok: false, error: 'Exchange failed' };
+        return { ok: true, accessToken: t.accessToken };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    }
+
+    case 'autoHeaders:get':
+      return getAutoHeaders();
+    case 'autoHeaders:set': {
+      const { items } = input as { items: Parameters<typeof setAutoHeaders>[0] };
+      setAutoHeaders(items);
+      return { ok: true as const };
+    }
+
     // ──── Sync
     case 'sync:status':
       return getSyncStatus();
@@ -465,12 +705,63 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       void forceSync(workspaceId);
       return { started: true };
     }
+    case 'conflict:list': {
+      const { workspaceId } = input as { workspaceId: string };
+      const rows = listActiveConflicts(workspaceId);
+      return rows.map((r) => ({
+        id: r.id,
+        workspaceId: r.workspaceId,
+        table: r.table as 'collection' | 'request' | 'environment',
+        rowId: r.rowId,
+        previousState: parseConflictPrevState(r.previousState),
+        overwrittenByName: r.overwrittenByName,
+        overwrittenByUserId: r.overwrittenByUserId,
+        overwrittenAt: r.overwrittenAt,
+        dismissedAt: r.dismissedAt,
+      }));
+    }
+    case 'conflict:dismiss': {
+      const { id } = input as { id: string };
+      dismissConflict(id);
+      return { ok: true as const };
+    }
+    case 'conflict:restore': {
+      // "Restore mine" — re-apply the captured previousState to the local
+      // row, dismiss the conflict, mark the row dirty so the next push
+      // sends it back to the server. We do NOT call the backend conflict
+      // log endpoint: that one's for backend-side concurrent pushes; ours
+      // is a local-history of pull-overwrites.
+      const { id } = input as { id: string };
+      const row = getConflictById(id);
+      if (!row) return { ok: false, error: 'Conflict not found.' };
+      const prev = parseConflictPrevState(row.previousState) as Record<string, unknown> | null;
+      if (!prev || typeof prev !== 'object') {
+        return { ok: false, error: 'Conflict has no previous state.' };
+      }
+      try {
+        if (row.table === 'collection') {
+          updateCollection(row.rowId, prev as never);
+        } else if (row.table === 'request') {
+          updateRequest(row.rowId, prev as never);
+        } else if (row.table === 'environment') {
+          updateEnvironment(row.rowId, prev as never);
+        }
+        dismissConflict(id);
+        notifyDirty();
+        // Force a push so the user sees their change re-applied on the
+        // server within a second instead of the periodic 5s window.
+        void forceSync(row.workspaceId);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    }
 
     // ──── Import
     case 'import:source': {
       const args = input as {
         workspaceId: string;
-        source: 'postman' | 'insomnia' | 'openapi' | 'curl';
+        source: 'postman' | 'insomnia' | 'openapi' | 'curl' | 'har';
         filePath?: string;
         content?: string;
       };
@@ -507,6 +798,27 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       }
       return { cancelled: false, filePath: result.filePaths[0] };
     }
+    case 'app:readFileText': {
+      const { filePath, maxBytes } = input as { filePath: string; maxBytes?: number };
+      const cap = maxBytes ?? 4 * 1024 * 1024;
+      try {
+        const fd = fs.openSync(filePath, 'r');
+        try {
+          const stat = fs.fstatSync(fd);
+          const toRead = Math.min(cap, stat.size);
+          const buf = Buffer.alloc(toRead);
+          fs.readSync(fd, buf, 0, toRead, 0);
+          return {
+            content: buf.toString('utf-8'),
+            truncated: stat.size > toRead,
+          };
+        } finally {
+          fs.closeSync(fd);
+        }
+      } catch (e) {
+        return { content: '', truncated: false, error: (e as Error).message };
+      }
+    }
 
     default:
       throw new Error(`Unknown IPC channel: ${channel}`);
@@ -519,7 +831,7 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
 
 function runImport(args: {
   workspaceId: string;
-  source: 'postman' | 'insomnia' | 'openapi' | 'curl';
+  source: 'postman' | 'insomnia' | 'openapi' | 'curl' | 'har';
   filePath?: string;
   content?: string;
 }) {
@@ -575,12 +887,30 @@ function runImport(args: {
         errorMessage: r.error,
       };
     }
+    case 'har': {
+      const r = importHar(args.workspaceId, content);
+      return {
+        success: r.success,
+        collectionId: r.rootCollectionId,
+        summary: r.summary,
+        errorMessage: r.error,
+      };
+    }
   }
 }
 
 // Heuristic: history needs a workspaceId; we infer it from the first
 // non-deleted workspace if the request didn't specify one (true for ad-hoc).
 // Renderer should pass workspaceId explicitly in v1.0.
+function parseConflictPrevState(s: unknown): unknown {
+  if (typeof s !== 'string') return s ?? null;
+  try {
+    return JSON.parse(s);
+  } catch {
+    return null;
+  }
+}
+
 function guessActiveWorkspace(): string | null {
   const wss = listWorkspaces();
   return wss[0]?.id ?? null;

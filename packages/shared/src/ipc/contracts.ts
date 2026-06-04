@@ -11,6 +11,7 @@ import {
   Collection,
   Environment,
   HistoryEntry,
+  MockDefinition,
   SendRequestInput,
   SendRequestOutput,
   Workspace,
@@ -31,6 +32,222 @@ export const RequestSendContract = {
 export const RequestCancelContract = {
   input: z.object({ inFlightId: z.string() }),
   output: z.object({ cancelled: z.boolean() }),
+} as const;
+
+// Save the body of the last response to a user-chosen file. Caller passes
+// either base64-encoded body (small responses) or a temp file path (large
+// responses that were streamed to disk).
+export const ResponseSaveBodyContract = {
+  input: z
+    .object({
+      defaultName: z.string(),
+      contentBase64: z.string().nullable().optional(),
+      tempPath: z.string().nullable().optional(),
+    })
+    .refine((d) => Boolean(d.contentBase64) || Boolean(d.tempPath), {
+      message: 'Either contentBase64 or tempPath must be provided',
+    }),
+  output: z.object({
+    success: z.boolean(),
+    cancelled: z.boolean().optional(),
+    path: z.string().optional(),
+    errorMessage: z.string().optional(),
+  }),
+} as const;
+
+// gRPC — proto loading + unary call. Streaming + reflection come in a
+// follow-up milestone. The proto file is referenced by absolute path on
+// disk; the renderer picks it via a file dialog and stores the path on the
+// request's body.
+export const GrpcLoadProtoContract = {
+  input: z.object({ protoPath: z.string().min(1) }),
+  output: z.object({
+    ok: z.boolean(),
+    services: z
+      .array(
+        z.object({
+          name: z.string(),
+          methods: z.array(
+            z.object({
+              name: z.string(),
+              requestStream: z.boolean(),
+              responseStream: z.boolean(),
+              requestType: z.string(),
+              responseType: z.string(),
+            }),
+          ),
+        }),
+      )
+      .default([]),
+    error: z.string().optional(),
+  }),
+} as const;
+
+export const GrpcInvokeContract = {
+  input: z.object({
+    address: z.string().min(1),
+    protoPath: z.string().min(1),
+    service: z.string().min(1),
+    method: z.string().min(1),
+    message: z.string().default('{}'),
+    metadata: z.record(z.string()).optional(),
+    timeoutMs: z.number().int().min(0).optional(),
+  }),
+  output: z.discriminatedUnion('ok', [
+    z.object({
+      ok: z.literal(true),
+      response: z.unknown(),
+      durationMs: z.number(),
+    }),
+    z.object({
+      ok: z.literal(false),
+      errorCode: z.string(),
+      errorMessage: z.string(),
+      durationMs: z.number(),
+    }),
+  ]),
+} as const;
+
+// Streaming RPCs — open returns a connectionId; the renderer drives further
+// sends via grpc:streamSend / grpc:streamHalfClose and tears down via
+// grpc:streamClose. Server → client messages and state changes are pushed
+// back as `grpc:stream:message` / `grpc:stream:state` events.
+export const GrpcOpenStreamContract = {
+  input: z.object({
+    address: z.string().min(1),
+    protoPath: z.string().min(1),
+    service: z.string().min(1),
+    method: z.string().min(1),
+    message: z.string().optional(),
+    metadata: z.record(z.string()).optional(),
+  }),
+  output: z.discriminatedUnion('ok', [
+    z.object({
+      ok: z.literal(true),
+      connectionId: z.string(),
+      mode: z.enum(['server', 'client', 'bidi']),
+    }),
+    z.object({
+      ok: z.literal(false),
+      errorCode: z.string(),
+      errorMessage: z.string(),
+    }),
+  ]),
+} as const;
+
+export const GrpcStreamSendContract = {
+  input: z.object({ connectionId: z.string(), message: z.string() }),
+  output: z.object({ ok: z.boolean(), error: z.string().optional() }),
+} as const;
+
+export const GrpcStreamHalfCloseContract = {
+  input: z.object({ connectionId: z.string() }),
+  output: z.object({ ok: z.boolean(), error: z.string().optional() }),
+} as const;
+
+export const GrpcStreamCloseContract = {
+  input: z.object({ connectionId: z.string() }),
+  output: z.object({ ok: z.boolean() }),
+} as const;
+
+// Plugin runtime — discovers user-supplied .js files under the plugins
+// folder, evaluates each in its own vm context, and exposes registered
+// response-body transformers. UI surfaces include a Plugins modal (list +
+// reload + open folder) and a Transform dropdown in the response viewer.
+const TransformerInfoSchema = z.object({
+  id: z.string(),
+  pluginId: z.string(),
+  localId: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  matchContentType: z.string().optional(),
+});
+const PluginInfoSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  version: z.string().optional(),
+  filePath: z.string(),
+  error: z.string().nullable(),
+  transformers: z.array(TransformerInfoSchema),
+});
+
+export const PluginsListContract = {
+  input: z.object({}),
+  output: z.object({
+    plugins: z.array(PluginInfoSchema),
+    dir: z.string(),
+  }),
+} as const;
+
+export const PluginsReloadContract = {
+  input: z.object({}),
+  output: z.object({
+    loaded: z.number().int(),
+    errored: z.number().int(),
+    dir: z.string(),
+    plugins: z.array(PluginInfoSchema),
+  }),
+} as const;
+
+export const PluginsOpenFolderContract = {
+  input: z.object({}),
+  output: z.object({ ok: z.boolean(), dir: z.string() }),
+} as const;
+
+export const PluginsApplyTransformerContract = {
+  input: z.object({
+    transformerId: z.string(),
+    body: z.string(),
+    contentType: z.string().nullable().optional(),
+    headers: z.record(z.string()).optional(),
+  }),
+  output: z.discriminatedUnion('ok', [
+    z.object({
+      ok: z.literal(true),
+      body: z.string(),
+      contentType: z.string().nullable(),
+    }),
+    z.object({ ok: z.literal(false), error: z.string() }),
+  ]),
+} as const;
+
+// Mock server — local HTTP server that answers matching requests with
+// predefined responses (per-collection mocks). Status broadcast on change.
+export const MockStatusContract = {
+  input: z.object({}),
+  output: z.object({
+    running: z.boolean(),
+    port: z.number().int().min(1).max(65535),
+    activeMockCount: z.number().int(),
+    error: z.string().optional(),
+  }),
+} as const;
+export const MockStartContract = {
+  input: z.object({ port: z.number().int().min(1).max(65535).optional() }),
+  output: z.object({
+    running: z.boolean(),
+    port: z.number().int().min(1).max(65535),
+    error: z.string().optional(),
+  }),
+} as const;
+export const MockStopContract = {
+  input: z.object({}),
+  output: z.object({ running: z.literal(false) }),
+} as const;
+
+// WebSocket — persistent connection lives in main; messages are pushed back
+// to the renderer via 'volt:event' with kind 'ws:message' or 'ws:state'.
+export const WsOpenContract = {
+  input: z.object({ url: z.string() }),
+  output: z.object({ connectionId: z.string(), ok: z.boolean(), error: z.string().optional() }),
+} as const;
+export const WsSendContract = {
+  input: z.object({ connectionId: z.string(), text: z.string() }),
+  output: z.object({ ok: z.boolean(), error: z.string().optional() }),
+} as const;
+export const WsCloseContract = {
+  input: z.object({ connectionId: z.string() }),
+  output: z.object({ ok: z.boolean() }),
 } as const;
 
 // ─────────────────────────────────────────────────────────
@@ -86,6 +303,7 @@ export const CollectionUpdateContract = {
     description: z.string().max(200_000).optional(),
     sortOrder: z.number().int().optional(),
     variables: z.array(Variable).optional(),
+    mocks: z.array(MockDefinition).optional(),
   }),
   output: Collection,
 } as const;
@@ -93,6 +311,23 @@ export const CollectionUpdateContract = {
 export const CollectionDeleteContract = {
   input: z.object({ id: uuid }),
   output: z.object({ deleted: z.boolean() }),
+} as const;
+
+export const CollectionExportContract = {
+  input: z.object({
+    workspaceId: uuid,
+    // If omitted, exports everything in the workspace under a synthetic root.
+    collectionId: uuid.optional(),
+    format: z.enum(['postman', 'insomnia', 'openapi', 'markdown']),
+  }),
+  output: z.object({
+    success: z.boolean(),
+    /** Absolute path of the written file on disk. */
+    path: z.string().optional(),
+    /** "User cancelled" when the save dialog was dismissed. */
+    cancelled: z.boolean().optional(),
+    errorMessage: z.string().optional(),
+  }),
 } as const;
 
 // ─────────────────────────────────────────────────────────
@@ -258,6 +493,40 @@ export const SyncForceContract = {
   output: z.object({ started: z.boolean() }),
 } as const;
 
+// Local conflict log — populated by the sync engine when a pull overwrites
+// a row that had unpushed local edits. The renderer reads this list to
+// show the conflict banner + the resolution modal; restore re-applies the
+// captured previousState as a fresh local edit so the next push wins.
+const ConflictRowSchema = z.object({
+  id: z.string(),
+  workspaceId: uuid,
+  table: z.enum(['collection', 'request', 'environment']),
+  rowId: z.string(),
+  previousState: z.unknown(),
+  overwrittenByName: z.string(),
+  overwrittenByUserId: z.string(),
+  overwrittenAt: z.number().int(),
+  dismissedAt: z.number().int().nullable(),
+});
+
+export const ConflictListContract = {
+  input: z.object({ workspaceId: uuid }),
+  output: z.array(ConflictRowSchema),
+} as const;
+
+export const ConflictDismissContract = {
+  input: z.object({ id: z.string() }),
+  output: z.object({ ok: z.literal(true) }),
+} as const;
+
+export const ConflictRestoreContract = {
+  input: z.object({ id: z.string() }),
+  output: z.object({
+    ok: z.boolean(),
+    error: z.string().optional(),
+  }),
+} as const;
+
 // ─────────────────────────────────────────────────────────
 // Import
 // ─────────────────────────────────────────────────────────
@@ -265,7 +534,7 @@ export const SyncForceContract = {
 export const ImportSourceContract = {
   input: z.object({
     workspaceId: uuid,
-    source: z.enum(['postman', 'insomnia', 'openapi', 'curl']),
+    source: z.enum(['postman', 'insomnia', 'openapi', 'curl', 'har']),
     // Either a file path on disk OR raw content (used for curl paste)
     filePath: z.string().optional(),
     content: z.string().optional(),
@@ -312,6 +581,19 @@ export const ShowFilePickerContract = {
   }),
 } as const;
 
+export const ReadFileTextContract = {
+  input: z.object({
+    filePath: z.string(),
+    /** Read at most this many bytes (default 4 MiB). Used by import preview. */
+    maxBytes: z.number().int().positive().optional(),
+  }),
+  output: z.object({
+    content: z.string(),
+    truncated: z.boolean(),
+    error: z.string().optional(),
+  }),
+} as const;
+
 // ─────────────────────────────────────────────────────────
 // Teams (proxied to backend on the user's behalf)
 // ─────────────────────────────────────────────────────────
@@ -338,6 +620,34 @@ export const TeamAcceptInviteContract = {
 } as const;
 
 // ─────────────────────────────────────────────────────────
+// Billing & audit log (proxied to backend)
+// ─────────────────────────────────────────────────────────
+
+export const TeamBillingContract = {
+  input: z.object({ teamId: uuid }),
+  // The backend returns plan, status, currentPeriodEnd, cancelAtPeriodEnd,
+  // and a `configured` flag indicating whether Stripe env vars are set.
+  output: z.any(),
+} as const;
+
+export const TeamBillingCheckoutContract = {
+  input: z.object({ teamId: uuid }),
+  // Returns { url, sessionId }. The desktop handler opens `url` in the
+  // default browser via shell.openExternal as a convenience.
+  output: z.any(),
+} as const;
+
+export const TeamBillingPortalContract = {
+  input: z.object({ teamId: uuid }),
+  output: z.any(),
+} as const;
+
+export const TeamAuditLogContract = {
+  input: z.object({ teamId: uuid, limit: z.number().int().optional() }),
+  output: z.any(),
+} as const;
+
+// ─────────────────────────────────────────────────────────
 // Globals — per-device key/value set from pre/post-request scripts.
 // ─────────────────────────────────────────────────────────
 
@@ -356,6 +666,63 @@ export const GlobalsDeleteContract = {
   output: z.object({ ok: z.literal(true) }),
 } as const;
 
+const OAuth2ConfigSchema = z.object({
+  grant: z.enum(['client_credentials', 'password', 'authorization_code']),
+  tokenUrl: z.string(),
+  authUrl: z.string().optional(),
+  redirectUri: z.string().optional(),
+  clientId: z.string(),
+  clientSecret: z.string().optional(),
+  scope: z.string().optional(),
+  username: z.string().optional(),
+  password: z.string().optional(),
+  tokenCacheKey: z.string(),
+});
+
+export const OAuthEnsureTokenContract = {
+  input: OAuth2ConfigSchema,
+  output: z.object({
+    ok: z.boolean(),
+    accessToken: z.string().optional(),
+    tokenType: z.string().optional(),
+    expiresAt: z.number().optional(),
+    error: z.string().optional(),
+  }),
+} as const;
+export const OAuthGetAuthUrlContract = {
+  input: OAuth2ConfigSchema,
+  output: z.object({ url: z.string(), verifier: z.string() }),
+} as const;
+export const OAuthExchangeCodeContract = {
+  input: OAuth2ConfigSchema.extend({
+    code: z.string(),
+    verifier: z.string(),
+  }),
+  output: z.object({
+    ok: z.boolean(),
+    accessToken: z.string().optional(),
+    error: z.string().optional(),
+  }),
+} as const;
+
+// Auto headers attached to every outgoing request unless overridden by the
+// user's request headers (case-insensitive). Stored globally per-device.
+const AutoHeaderSchema = z.object({
+  key: z.string().min(1).max(200),
+  value: z.string().max(2_000),
+  enabled: z.boolean(),
+  builtin: z.boolean().optional(),
+  description: z.string().optional(),
+});
+export const AutoHeadersGetContract = {
+  input: z.object({}),
+  output: z.array(AutoHeaderSchema),
+} as const;
+export const AutoHeadersSetContract = {
+  input: z.object({ items: z.array(AutoHeaderSchema) }),
+  output: z.object({ ok: z.literal(true) }),
+} as const;
+
 // ─────────────────────────────────────────────────────────
 // Channel registry — single source of truth for the bridge.
 // The preload script reads this to build the typed window.volt API.
@@ -364,6 +731,27 @@ export const GlobalsDeleteContract = {
 export const IPC = {
   'request:send': RequestSendContract,
   'request:cancel': RequestCancelContract,
+  'response:saveBody': ResponseSaveBodyContract,
+
+  'ws:open': WsOpenContract,
+  'ws:send': WsSendContract,
+  'ws:close': WsCloseContract,
+
+  'grpc:loadProto': GrpcLoadProtoContract,
+  'grpc:invoke': GrpcInvokeContract,
+  'grpc:openStream': GrpcOpenStreamContract,
+  'grpc:streamSend': GrpcStreamSendContract,
+  'grpc:streamHalfClose': GrpcStreamHalfCloseContract,
+  'grpc:streamClose': GrpcStreamCloseContract,
+
+  'mock:status': MockStatusContract,
+  'mock:start': MockStartContract,
+  'mock:stop': MockStopContract,
+
+  'plugins:list': PluginsListContract,
+  'plugins:reload': PluginsReloadContract,
+  'plugins:openFolder': PluginsOpenFolderContract,
+  'plugins:applyTransformer': PluginsApplyTransformerContract,
 
   'workspace:list': WorkspaceListContract,
   'workspace:create': WorkspaceCreateContract,
@@ -374,6 +762,7 @@ export const IPC = {
   'collection:create': CollectionCreateContract,
   'collection:update': CollectionUpdateContract,
   'collection:delete': CollectionDeleteContract,
+  'collection:export': CollectionExportContract,
 
   'apiRequest:list': RequestListContract,
   'apiRequest:get': RequestGetContract,
@@ -401,19 +790,35 @@ export const IPC = {
   'team:create': TeamCreateContract,
   'team:invite': TeamInviteContract,
   'team:acceptInvite': TeamAcceptInviteContract,
+  'team:billing': TeamBillingContract,
+  'team:billingCheckout': TeamBillingCheckoutContract,
+  'team:billingPortal': TeamBillingPortalContract,
+  'team:auditLog': TeamAuditLogContract,
 
   'globals:list': GlobalsListContract,
   'globals:set': GlobalsSetContract,
   'globals:delete': GlobalsDeleteContract,
 
+  'oauth:ensureToken': OAuthEnsureTokenContract,
+  'oauth:getAuthUrl': OAuthGetAuthUrlContract,
+  'oauth:exchangeCode': OAuthExchangeCodeContract,
+
+  'autoHeaders:get': AutoHeadersGetContract,
+  'autoHeaders:set': AutoHeadersSetContract,
+
   'sync:status': SyncStatusContract,
   'sync:force': SyncForceContract,
+
+  'conflict:list': ConflictListContract,
+  'conflict:dismiss': ConflictDismissContract,
+  'conflict:restore': ConflictRestoreContract,
 
   'import:source': ImportSourceContract,
 
   'app:info': AppInfoContract,
   'app:openExternal': OpenExternalContract,
   'app:showFilePicker': ShowFilePickerContract,
+  'app:readFileText': ReadFileTextContract,
 } as const;
 
 export type IpcChannel = keyof typeof IPC;

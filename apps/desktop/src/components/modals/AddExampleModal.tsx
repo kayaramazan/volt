@@ -28,6 +28,8 @@ type RawRequest = {
   bodyType: string;
   body: unknown;
   auth: unknown;
+  preRequestScript?: string;
+  postResponseScript?: string;
   examples?: unknown[];
 };
 
@@ -60,8 +62,9 @@ export function AddExampleModal() {
     const trimmed = name.trim();
     if (!trimmed) return;
     try {
-      const snapshot = buildSnapshot(request as RawRequest, lastResponse, trimmed);
-      const currentExamples = ((request as RawRequest).examples as unknown[]) ?? [];
+      const snapshot = buildSnapshot(request as unknown as RawRequest, lastResponse, trimmed);
+      const currentExamples =
+        ((request as unknown as RawRequest).examples as unknown[]) ?? [];
       await update.mutateAsync({
         id: request.id,
         examples: [...currentExamples, snapshot],
@@ -150,6 +153,10 @@ function buildSnapshot(req: RawRequest, resp: RawResponse | undefined, name: str
       bodyType: req.bodyType,
       body: req.body,
       auth: req.auth,
+      // Snapshot the scripts so the example reproduces the exact pre/post
+      // behavior it was captured with — not whatever the user has now.
+      preRequestScript: req.preRequestScript ?? '',
+      postResponseScript: req.postResponseScript ?? '',
     },
     response: resp
       ? resp.ok

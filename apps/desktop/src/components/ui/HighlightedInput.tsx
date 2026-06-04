@@ -1,7 +1,19 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, type InputHTMLAttributes, type CSSProperties } from 'react';
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+  type CSSProperties,
+  type InputHTMLAttributes,
+  type MouseEvent as ReactMouseEvent,
+} from 'react';
+import { createPortal } from 'react-dom';
 
 import { cn } from '@/lib/util';
-import { splitByVars } from '@/lib/var-highlight';
+import { splitByVars, VAR_REGEX } from '@/lib/var-highlight';
+import { VarEditor } from './VarEditor';
 
 type Props = Omit<InputHTMLAttributes<HTMLInputElement>, 'value'> & {
   value: string;
@@ -30,6 +42,12 @@ const SHARED_STYLE: CSSProperties = {
 const FONT_NORMAL = "normal 13px/2rem 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace";
 const FONT_FLAT = "normal 13px/1.75rem 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace";
 
+interface VarPopup {
+  name: string;
+  x: number;
+  y: number;
+}
+
 export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function HighlightedInput(
   { value, onChange, onScroll, className, invalid, flat, disabled, ...rest },
   ref,
@@ -52,6 +70,61 @@ export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function Hig
     return () => input.removeEventListener('scroll', sync);
   }, [value]);
 
+  // ── Hover-triggered VarEditor popup ────────────────────────────────────
+  const [popup, setPopup] = useState<VarPopup | null>(null);
+  const closeTimerRef = useRef<number | null>(null);
+  const popupHasFocusRef = useRef(false);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimerRef.current != null) {
+      clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+
+  const scheduleClose = useCallback(
+    (ms = 180) => {
+      cancelClose();
+      closeTimerRef.current = window.setTimeout(() => {
+        if (!popupHasFocusRef.current) setPopup(null);
+      }, ms);
+    },
+    [cancelClose],
+  );
+
+  // Cleanup on unmount.
+  useEffect(() => () => cancelClose(), [cancelClose]);
+
+  const handleMouseMove = useCallback(
+    (e: ReactMouseEvent<HTMLDivElement>) => {
+      const overlay = overlayRef.current;
+      if (!overlay) return;
+      const spans = overlay.querySelectorAll<HTMLElement>('[data-var-span="1"]');
+      for (const span of spans) {
+        const rect = span.getBoundingClientRect();
+        if (
+          e.clientX >= rect.left &&
+          e.clientX <= rect.right &&
+          e.clientY >= rect.top &&
+          e.clientY <= rect.bottom
+        ) {
+          const name = span.dataset.varName ?? '';
+          if (!name) return;
+          cancelClose();
+          // Only update state if we moved to a different var or none was open.
+          if (popup?.name !== name) {
+            setPopup({ name, x: rect.left, y: rect.bottom + 4 });
+          }
+          return;
+        }
+      }
+      // Not over any var span — schedule close (grace period lets user
+      // travel to the popup itself without it disappearing).
+      if (popup) scheduleClose();
+    },
+    [popup, cancelClose, scheduleClose],
+  );
+
   const parts = splitByVars(value);
   const textStyle: CSSProperties = {
     ...SHARED_STYLE,
@@ -61,6 +134,8 @@ export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function Hig
   return (
     <div
       onClick={() => inputRef.current?.focus()}
+      onMouseMove={handleMouseMove}
+      onMouseLeave={() => popup && scheduleClose()}
       className={cn(
         'relative isolate cursor-text',
         flat
@@ -71,19 +146,22 @@ export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function Hig
         className,
       )}
     >
-      {/* Overlay — paints the visible text using identical metrics to the input. */}
+      {/* Overlay — paints the visible text using identical metrics to the
+          input. pointer-events-none on EVERYTHING here, including VarSpans,
+          so clicks pass straight through to the input below for normal caret
+          positioning (incl. clicking inside a `{{var}}` token to edit it
+          letter-by-letter). Hover detection is done via mousemove on the
+          wrapper, hit-testing against VarSpan bounding rects. */}
       <div
         ref={overlayRef}
         aria-hidden
-        className="pointer-events-none absolute inset-0 z-0 overflow-hidden whitespace-pre text-text"
+        className="pointer-events-none absolute inset-0 z-20 overflow-hidden whitespace-pre text-text"
         style={textStyle}
       >
         {value ? (
           parts.map((p, i) =>
             p.isVar ? (
-              <span key={i} className="bg-accent/15 text-accent">
-                {p.text}
-              </span>
+              <VarSpan key={i} text={p.text} />
             ) : (
               <span key={i}>{p.text}</span>
             ),
@@ -108,6 +186,53 @@ export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function Hig
         style={textStyle}
         {...rest}
       />
+
+      {/* Portal the hover popup so it isn't clipped by overflow-hidden
+          ancestors (KeyValueEditor rows etc). */}
+      {popup &&
+        createPortal(
+          <div
+            className="fixed z-50"
+            style={{ top: popup.y, left: popup.x }}
+            onMouseEnter={cancelClose}
+            onMouseLeave={() => scheduleClose()}
+            onFocusCapture={() => {
+              popupHasFocusRef.current = true;
+              cancelClose();
+            }}
+            onBlurCapture={(e) => {
+              // Use relatedTarget to detect focus actually leaving the popup,
+              // not just moving between children.
+              const next = e.relatedTarget as Node | null;
+              if (!e.currentTarget.contains(next)) {
+                popupHasFocusRef.current = false;
+                scheduleClose();
+              }
+            }}
+          >
+            <VarEditor name={popup.name} onClose={() => setPopup(null)} />
+          </div>,
+          document.body,
+        )}
     </div>
   );
 });
+
+/**
+ * Visible `{{varname}}` token in the overlay. pointer-events-none so clicks
+ * pass through to the input below — hover detection is performed by the
+ * parent via mousemove + getBoundingClientRect hit-testing.
+ */
+function VarSpan({ text }: { text: string }) {
+  const m = new RegExp(VAR_REGEX.source).exec(text);
+  const name = m?.[1] ?? '';
+  return (
+    <span
+      data-var-span="1"
+      data-var-name={name}
+      className="rounded-sm bg-accent/15 text-accent"
+    >
+      {text}
+    </span>
+  );
+}

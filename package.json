@@ -10,6 +10,8 @@
     "build": "turbo run build",
     "build:desktop": "pnpm --filter @volt/desktop build",
     "build:backend": "pnpm --filter @volt/backend build",
+    "build:cli": "pnpm --filter @volt/cli build",
+    "volt": "pnpm --filter @volt/cli dev --",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test",

@@ -22,7 +22,7 @@ import { voltApi } from '@/lib/volt-api';
 export function useWorkspaces() {
   return useQuery({
     queryKey: ['workspaces'],
-    queryFn: () => voltApi['workspace:list'](undefined),
+    queryFn: () => voltApi['workspace:list']({}),
   });
 }
 
@@ -84,8 +84,13 @@ export function useUpdateCollection() {
       description?: string;
       sortOrder?: number;
       variables?: unknown;
+      mocks?: unknown;
     }) => voltApi['collection:update'](input as never),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['collections'] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['collections'] });
+      // Mock list may have changed — refresh the status pill too.
+      qc.invalidateQueries({ queryKey: ['mock-status'] });
+    },
   });
 }
 
@@ -298,7 +303,7 @@ export function useHistoryEntry(id: string | null) {
 export function useAuthStatus() {
   return useQuery({
     queryKey: ['auth-status'],
-    queryFn: () => voltApi['auth:status'](undefined),
+    queryFn: () => voltApi['auth:status']({}),
     refetchInterval: 60_000,  // refresh every minute in case session got revoked
   });
 }
@@ -313,7 +318,7 @@ export function useSignOut() {
   const qc = useQueryClient();
   return async function signOut() {
     try {
-      await voltApi['auth:logout'](undefined);
+      await voltApi['auth:logout']({});
     } catch (e) {
       // Even if the IPC fails (e.g. backend unreachable), clear local state
       // so the user isn't stuck in a half-signed-in screen.
@@ -329,15 +334,130 @@ export function useSignOut() {
 export function useSyncStatus() {
   return useQuery({
     queryKey: ['sync-status'],
-    queryFn: () => voltApi['sync:status'](undefined),
+    queryFn: () => voltApi['sync:status']({}),
     refetchInterval: 3_000,
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// Conflicts (local pull-overwrite log)
+// ─────────────────────────────────────────────────────────
+
+export function useConflicts(workspaceId: string | null) {
+  return useQuery({
+    queryKey: ['conflicts', workspaceId],
+    queryFn: () => voltApi['conflict:list']({ workspaceId: workspaceId! }),
+    enabled: !!workspaceId,
+  });
+}
+
+export function useDismissConflict() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string }) => voltApi['conflict:dismiss'](input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['conflicts'] }),
+  });
+}
+
+export function useRestoreConflict() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { id: string }) => voltApi['conflict:restore'](input),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['conflicts'] });
+      // The restore re-applies previousState to the local row, which means
+      // the affected resource just changed. Refresh the trees so the new
+      // values show up immediately.
+      qc.invalidateQueries({ queryKey: ['collections'] });
+      qc.invalidateQueries({ queryKey: ['requests'] });
+      qc.invalidateQueries({ queryKey: ['environments'] });
+    },
+  });
+}
+
+export function useMockStatus() {
+  return useQuery({
+    queryKey: ['mock-status'],
+    queryFn: () => voltApi['mock:status']({}),
+    refetchInterval: 5_000,
+  });
+}
+
+export function useStartMockServer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { port?: number }) => voltApi['mock:start'](input),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['mock-status'] }),
+  });
+}
+
+export function useStopMockServer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => voltApi['mock:stop']({}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['mock-status'] }),
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// Plugins
+// ─────────────────────────────────────────────────────────
+
+export function usePlugins() {
+  return useQuery({
+    queryKey: ['plugins'],
+    queryFn: () => voltApi['plugins:list']({}),
+  });
+}
+
+export function useReloadPlugins() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => voltApi['plugins:reload']({}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['plugins'] }),
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// Team billing + audit log (proxied through main → backend)
+// ─────────────────────────────────────────────────────────
+
+export function useTeamBilling(teamId: string | null) {
+  return useQuery({
+    queryKey: ['team-billing', teamId],
+    queryFn: () => voltApi['team:billing']({ teamId: teamId! }),
+    enabled: !!teamId,
+  });
+}
+
+export function useStartBillingCheckout() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { teamId: string }) => voltApi['team:billingCheckout'](input),
+    onSuccess: (_data, vars) => {
+      qc.invalidateQueries({ queryKey: ['team-billing', vars.teamId] });
+    },
+  });
+}
+
+export function useOpenBillingPortal() {
+  return useMutation({
+    mutationFn: (input: { teamId: string }) => voltApi['team:billingPortal'](input),
+  });
+}
+
+export function useTeamAuditLog(teamId: string | null) {
+  return useQuery({
+    queryKey: ['team-audit-log', teamId],
+    queryFn: () => voltApi['team:auditLog']({ teamId: teamId! }),
+    enabled: !!teamId,
   });
 }
 
 export function useAppInfo() {
   return useQuery({
     queryKey: ['app-info'],
-    queryFn: () => voltApi['app:info'](undefined),
+    queryFn: () => voltApi['app:info']({}),
     staleTime: Infinity,
   });
 }
@@ -369,6 +489,33 @@ export function useDeleteGlobal() {
   return useMutation({
     mutationFn: (key: string) => voltApi['globals:delete']({ key }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['globals'] }),
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// Auto headers (per-device default headers attached to every request)
+// ─────────────────────────────────────────────────────────
+
+export interface AutoHeader {
+  key: string;
+  value: string;
+  enabled: boolean;
+  builtin?: boolean;
+  description?: string;
+}
+
+export function useAutoHeaders() {
+  return useQuery({
+    queryKey: ['auto-headers'],
+    queryFn: () => voltApi['autoHeaders:get']({}) as Promise<AutoHeader[]>,
+  });
+}
+
+export function useSetAutoHeaders() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (items: AutoHeader[]) => voltApi['autoHeaders:set']({ items }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['auto-headers'] }),
   });
 }
 

@@ -19,10 +19,16 @@ interface BinaryBody {
   type: 'binary';
   filePath: string;
 }
+interface GraphQLBody {
+  type: 'graphql';
+  query: string;
+  variables: string;
+  operationName?: string;
+}
 interface NoneBody {
   type: 'none';
 }
-export type Body = RawBody | FormBody | UrlencodedBody | BinaryBody | NoneBody;
+export type Body = RawBody | FormBody | UrlencodedBody | BinaryBody | GraphQLBody | NoneBody;
 
 interface Props {
   body: Body;
@@ -53,6 +59,9 @@ export function BodyEditor({ body, onChange }: Props) {
       case 'binary':
         onChange({ type: 'binary', filePath: '' });
         return;
+      case 'graphql':
+        onChange({ type: 'graphql', query: '', variables: '' });
+        return;
     }
   }
 
@@ -66,6 +75,7 @@ export function BodyEditor({ body, onChange }: Props) {
           options={[
             { value: 'none', label: 'None' },
             { value: 'raw', label: 'Raw' },
+            { value: 'graphql', label: 'GraphQL' },
             { value: 'form', label: 'Form data' },
             { value: 'urlencoded', label: 'URL-encoded' },
             { value: 'binary', label: 'Binary' },
@@ -134,6 +144,34 @@ export function BodyEditor({ body, onChange }: Props) {
             <p className="border-t border-border px-2 py-1 text-[10px] text-text-muted">
               For file fields, edit JSON manually in v1.0 — file picker coming soon.
             </p>
+          </div>
+        )}
+        {body.type === 'graphql' && (
+          <div className="flex h-full flex-col gap-1">
+            <div className="flex min-h-0 flex-1 flex-col rounded border border-border">
+              <div className="border-b border-border bg-bg-elevated px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                Query
+              </div>
+              <CodeEditor
+                value={body.query}
+                onChange={(v) => onChange({ ...body, query: v })}
+                language="javascript"
+                className="h-full"
+                placeholder="query { viewer { id name } }"
+              />
+            </div>
+            <div className="flex h-32 flex-col rounded border border-border">
+              <div className="border-b border-border bg-bg-elevated px-2 py-1 text-[11px] font-semibold uppercase tracking-wide text-text-muted">
+                Variables (JSON)
+              </div>
+              <CodeEditor
+                value={body.variables}
+                onChange={(v) => onChange({ ...body, variables: v })}
+                language="json"
+                className="h-full"
+                placeholder='{ "id": 1 }'
+              />
+            </div>
           </div>
         )}
         {body.type === 'binary' && (

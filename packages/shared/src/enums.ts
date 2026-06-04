@@ -51,6 +51,17 @@ export const ERROR_CODES = {
   REQUEST_FAILED: 'REQUEST_FAILED',
   REQUEST_TIMEOUT: 'REQUEST_TIMEOUT',
   REQUEST_CANCELLED: 'REQUEST_CANCELLED',
+  // Billing / Stripe
+  STRIPE_NOT_CONFIGURED: 'STRIPE_NOT_CONFIGURED',
+  STRIPE_PRICE_NOT_CONFIGURED: 'STRIPE_PRICE_NOT_CONFIGURED',
+  WEBHOOK_SECRET_NOT_SET: 'WEBHOOK_SECRET_NOT_SET',
+  MISSING_SIGNATURE: 'MISSING_SIGNATURE',
+  INVALID_SIGNATURE: 'INVALID_SIGNATURE',
+  NO_STRIPE_CUSTOMER: 'NO_STRIPE_CUSTOMER',
+  // RBAC
+  TEAM_VIEWER_READ_ONLY: 'TEAM_VIEWER_READ_ONLY',
+  // Plan limits (paid tier)
+  PLAN_LIMIT_EXCEEDED: 'PLAN_LIMIT_EXCEEDED',
 } as const;
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
@@ -70,4 +81,32 @@ export const ERROR_MESSAGES_EN: Record<ErrorCode, string> = {
   REQUEST_FAILED: 'The request failed.',
   REQUEST_TIMEOUT: 'The request timed out.',
   REQUEST_CANCELLED: 'The request was cancelled.',
+  STRIPE_NOT_CONFIGURED: 'Billing is not enabled on this server.',
+  STRIPE_PRICE_NOT_CONFIGURED: 'No paid plan is configured on this server.',
+  WEBHOOK_SECRET_NOT_SET: 'Stripe webhook secret is not configured.',
+  MISSING_SIGNATURE: 'Missing Stripe signature header.',
+  INVALID_SIGNATURE: 'Invalid Stripe webhook signature.',
+  NO_STRIPE_CUSTOMER: 'This team has no Stripe customer yet.',
+  TEAM_VIEWER_READ_ONLY: 'Viewers cannot modify team data.',
+  PLAN_LIMIT_EXCEEDED: 'Your plan limit has been reached — upgrade to add more.',
+};
+
+// ─────────────────────────────────────────────────────────
+// Paid-tier plan limits
+//
+// Free is the default for any team without an active subscription. Pro
+// is unlocked once Stripe reports an active/trialing subscription. Limits
+// are enforced backend-side in TeamService.invite and WorkspaceService
+// (create + moveToTeam). The desktop UI mirrors the same shape so it can
+// show "3 / 5 members" indicators without an extra round-trip.
+// ─────────────────────────────────────────────────────────
+
+export interface PlanLimits {
+  maxMembers: number;
+  maxWorkspaces: number;
+}
+
+export const PLAN_LIMITS: Record<'FREE' | 'PRO', PlanLimits> = {
+  FREE: { maxMembers: 5, maxWorkspaces: 3 },
+  PRO: { maxMembers: 100, maxWorkspaces: 25 },
 };

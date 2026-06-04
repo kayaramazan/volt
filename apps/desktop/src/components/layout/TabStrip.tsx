@@ -29,9 +29,13 @@ export function TabStrip() {
   return (
     <div className="flex h-9 items-center gap-px overflow-x-auto border-b border-border bg-bg">
       {openTabs.map((id, i) => {
-        const data = results[i]?.data as { name?: string; method?: string } | undefined;
+        const data = results[i]?.data as
+          | { name?: string; method?: string; body?: { type?: string } }
+          | undefined;
         const active = id === requestId;
         const dirty = drafts.has(id); // crude — would track per-tab dirtiness via deep compare
+        const isGrpc = data?.body?.type === 'grpc';
+        const label = isGrpc ? 'gRPC' : (data?.method ?? 'GET').slice(0, 4);
         return (
           <div
             key={id}
@@ -43,8 +47,8 @@ export function TabStrip() {
                 : 'bg-bg text-text-muted hover:bg-bg-elevated/60 hover:text-text',
             )}
           >
-            <span className={cn('font-mono text-[9px] font-semibold', methodColorClass(data?.method ?? 'GET'))}>
-              {(data?.method ?? 'GET').slice(0, 4)}
+            <span className={cn('font-mono text-[9px] font-semibold', isGrpc ? 'text-accent' : methodColorClass(data?.method ?? 'GET'))}>
+              {label}
             </span>
             <span className="max-w-[140px] truncate">{data?.name ?? 'Loading…'}</span>
             {dirty && <span className="text-accent">•</span>}

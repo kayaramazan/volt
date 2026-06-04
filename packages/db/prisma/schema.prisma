@@ -89,10 +89,12 @@ model Team {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  owner      User         @relation("TeamOwner", fields: [ownerId], references: [id])
-  members    TeamMember[]
-  invites    TeamInvite[]
-  workspaces Workspace[]  @relation("WorkspaceTeam")
+  owner        User             @relation("TeamOwner", fields: [ownerId], references: [id])
+  members      TeamMember[]
+  invites      TeamInvite[]
+  workspaces   Workspace[]      @relation("WorkspaceTeam")
+  subscription Subscription?
+  auditLog     AuditLogEntry[]
 
   @@map("teams")
 }
@@ -288,4 +290,82 @@ model ConflictLog {
 
   @@index([workspaceId, overwrittenAt])
   @@map("conflict_log")
+}
+
+// ─────────────────────────────────────────────────────────
+// Billing — one Subscription per Team, kept in sync with Stripe via the
+// /webhooks/stripe handler. Teams default to FREE; PRO unlocks higher
+// member + workspace limits and the priority-support flag.
+// ─────────────────────────────────────────────────────────
+
+enum PlanTier {
+  FREE
+  PRO
+}
+
+// Mirrors the Stripe subscription.status enum so we can interpret the
+// webhook events without translation.
+enum SubscriptionStatus {
+  ACTIVE
+  TRIALING
+  PAST_DUE
+  CANCELED
+  INCOMPLETE
+  INCOMPLETE_EXPIRED
+  UNPAID
+  PAUSED
+}
+
+model Subscription {
+  id                   String              @id @default(uuid()) @db.Uuid
+  teamId               String              @unique @map("team_id") @db.Uuid
+  plan                 PlanTier            @default(FREE)
+  status               SubscriptionStatus  @default(ACTIVE)
+  stripeCustomerId     String?             @map("stripe_customer_id")
+  stripeSubscriptionId String?             @unique @map("stripe_subscription_id")
+  stripePriceId        String?             @map("stripe_price_id")
+  currentPeriodEnd     DateTime?           @map("current_period_end")
+  cancelAtPeriodEnd    Boolean             @default(false) @map("cancel_at_period_end")
+  createdAt            DateTime            @default(now()) @map("created_at")
+  updatedAt            DateTime            @updatedAt @map("updated_at")
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@map("subscriptions")
+}
+
+// ─────────────────────────────────────────────────────────
+// Audit log — append-only record of team-scoped actions. Visible to
+// OWNERs via /teams/:id/audit-log; useful for incident review and
+// compliance asks ("when did X get added/removed?").
+// ─────────────────────────────────────────────────────────
+
+enum AuditAction {
+  TEAM_CREATED
+  TEAM_DELETED
+  MEMBER_INVITED
+  MEMBER_JOINED
+  MEMBER_ROLE_CHANGED
+  MEMBER_REMOVED
+  OWNERSHIP_TRANSFERRED
+  BILLING_CHECKOUT_STARTED
+  BILLING_PORTAL_OPENED
+  BILLING_PLAN_CHANGED
+  BILLING_CANCELED
+}
+
+model AuditLogEntry {
+  id         String      @id @default(uuid()) @db.Uuid
+  teamId     String      @map("team_id") @db.Uuid
+  // The acting user. Null for system events (e.g., Stripe webhook updates).
+  actorId    String?     @map("actor_id") @db.Uuid
+  action     AuditAction
+  // Free-form details: target user id, old/new role, Stripe price, etc.
+  metadata   Json        @default("{}")
+  createdAt  DateTime    @default(now()) @map("created_at")
+
+  team Team @relation(fields: [teamId], references: [id], onDelete: Cascade)
+
+  @@index([teamId, createdAt])
+  @@map("audit_log")
 }

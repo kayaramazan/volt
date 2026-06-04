@@ -45,6 +45,9 @@ export function startSync() {
     setState('offline');
     return;
   }
+  // A fresh start from a clean state — drop any prior circuit-breaker
+  // trip so we'll try the backend again.
+  resetCircuitBreaker();
   setState('synced');
   schedulePush();
   schedulePull();
@@ -59,6 +62,55 @@ export function stopSync() {
   for (const controller of sseControllers.values()) controller.abort();
   sseControllers.clear();
   setState('offline');
+}
+
+// ─────────────────────────────────────────────────────────
+// Offline circuit breaker
+//
+// After N consecutive "backend unreachable" failures the engine stops
+// retrying entirely so the terminal isn't peppered with reconnect
+// attempts. The breaker only re-arms via:
+//   - startSync() — e.g. a fresh login starts the engine over
+//   - forceSync() — user explicitly clicks the sync indicator
+// Successful operations reset the counter.
+// ─────────────────────────────────────────────────────────
+
+const UNREACHABLE_TRIP_THRESHOLD = 3;
+let unreachableCount = 0;
+let breakerTripped = false;
+
+function recordUnreachable() {
+  unreachableCount += 1;
+  if (!breakerTripped && unreachableCount >= UNREACHABLE_TRIP_THRESHOLD) {
+    tripCircuitBreaker();
+  }
+}
+
+function tripCircuitBreaker() {
+  if (breakerTripped) return;
+  breakerTripped = true;
+  console.log(
+    `[sync] backend unreachable ${UNREACHABLE_TRIP_THRESHOLD}x — pausing sync (click the sync indicator or sign in again to retry)`,
+  );
+  if (pushTimer) clearInterval(pushTimer);
+  if (pullTimer) clearInterval(pullTimer);
+  pushTimer = null;
+  pullTimer = null;
+  for (const controller of sseControllers.values()) controller.abort();
+  sseControllers.clear();
+  sseBackoff.clear();
+  setState('offline');
+}
+
+function resetCircuitBreaker() {
+  unreachableCount = 0;
+  breakerTripped = false;
+}
+
+function recordReachable() {
+  if (unreachableCount !== 0 || breakerTripped) {
+    resetCircuitBreaker();
+  }
 }
 
 /**
@@ -84,6 +136,7 @@ function schedulePush() {
 
 async function runPushOnce() {
   if (currentState === 'syncing') return; // already in progress
+  if (breakerTripped) return; // backend was unreachable, stand down
   const all = listWorkspaces();
   const workspacesToSync = all.filter((w) => !w.localOnly && w.dirty);
   if (workspacesToSync.length === 0) {
@@ -108,11 +161,20 @@ async function runPushOnce() {
       console.log(`[sync] pushing workspace ${ws.id} (${ws.name}) baseRev=${ws.remoteRevision}`);
       await pushWorkspace(ws.id, ws.remoteRevision);
       console.log(`[sync] push ok for ${ws.id}`);
+      recordReachable();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      console.error(`[sync] push FAILED for ${ws.id}:`, msg);
-      lastError = msg;
-      setState('error');
+      if (isBackendUnreachable(err)) {
+        console.log(`[sync] push skipped (backend unreachable) for ${ws.id}`);
+        setState('offline');
+        recordUnreachable();
+        // Once the breaker trips, no point trying other workspaces — same outcome.
+        if (breakerTripped) return;
+      } else {
+        console.error(`[sync] push FAILED for ${ws.id}:`, msg);
+        lastError = msg;
+        setState('error');
+      }
     }
   }
 }
@@ -250,13 +312,22 @@ function schedulePull() {
 
 async function runPullOnce() {
   if (currentState === 'syncing') return;
+  if (breakerTripped) return; // backend was unreachable, stand down
   const wss = listWorkspaces().filter((w) => !w.localOnly);
   for (const ws of wss) {
     try {
       await pullWorkspace(ws.id);
+      recordReachable();
     } catch (err) {
-      // Single workspace failing is non-fatal — log and continue
-      console.error(`Pull failed for workspace ${ws.id}:`, err);
+      // Single workspace failing is non-fatal — log and continue. Quiet
+      // the common "backend isn't running" cases.
+      if (isBackendUnreachable(err)) {
+        console.log(`[sync] pull skipped (backend unreachable) for ${ws.id}`);
+        recordUnreachable();
+        if (breakerTripped) return;
+      } else {
+        console.error(`Pull failed for workspace ${ws.id}:`, err);
+      }
     }
   }
 }
@@ -335,6 +406,7 @@ function openStreams() {
 function openStream(workspaceId: string) {
   const token = currentSessionToken();
   if (!token) return;
+  if (breakerTripped) return;
 
   const controller = new AbortController();
   sseControllers.set(workspaceId, controller);
@@ -355,6 +427,10 @@ function openStream(workspaceId: string) {
         scheduleSseReconnect(workspaceId);
         return;
       }
+      // Connected — clear any backoff and reset the offline breaker
+      // (we know the backend is alive now).
+      resetSseBackoff(workspaceId);
+      recordReachable();
       const reader = res.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -371,25 +447,64 @@ function openStream(workspaceId: string) {
       }
     } catch (err) {
       if ((err as Error)?.name === 'AbortError') return;
-      // "other side closed" / UND_ERR_SOCKET is normal when the backend
-      // restarts or the connection is idle-pruned. We auto-reconnect below.
-      const code = (err as { cause?: { code?: string } })?.cause?.code;
-      if (code === 'UND_ERR_SOCKET') {
-        console.log('[sync] SSE disconnected, will reconnect');
+      // The backend can be unreachable for a few normal reasons:
+      //   - backend isn't running yet (ECONNREFUSED) — common in dev
+      //   - DNS not resolved yet on cold start (ENOTFOUND)
+      //   - idle SSE got socket-pruned (UND_ERR_SOCKET)
+      // Log them quietly (one short line) and back off; reserve the noisy
+      // stack-trace path for anything genuinely unexpected.
+      if (isBackendUnreachable(err)) {
+        const code = (err as { cause?: { code?: string } })?.cause?.code ?? 'ECONNREFUSED';
+        console.log(`[sync] backend unreachable (${code}), will retry`);
+        recordUnreachable();
       } else {
-        console.warn('[sync] SSE error:', err);
+        const code = (err as { cause?: { code?: string } })?.cause?.code;
+        if (code === 'UND_ERR_SOCKET') {
+          console.log('[sync] SSE disconnected, will reconnect');
+        } else {
+          console.warn('[sync] SSE error:', (err as Error).message ?? err);
+        }
       }
     } finally {
       sseControllers.delete(workspaceId);
-      if (!controller.signal.aborted) scheduleSseReconnect(workspaceId);
+      if (!controller.signal.aborted && !breakerTripped) {
+        scheduleSseReconnect(workspaceId);
+      }
     }
   })();
 }
 
+// Per-workspace reconnect attempt counter. Resets on successful read in
+// the loop above by way of openStream() being called fresh each time —
+// but we want the counter to drop back to zero once a real connection
+// holds, so we clear it from inside the read loop when the first byte
+// arrives. For now, simple capped exponential backoff is enough to stop
+// the every-5s spam when the backend is offline.
+const sseBackoff = new Map<string, number>();
+const MAX_SSE_BACKOFF_MS = 60_000;
+
 function scheduleSseReconnect(workspaceId: string) {
+  const prev = sseBackoff.get(workspaceId) ?? 0;
+  const next = Math.min(prev === 0 ? 5_000 : prev * 2, MAX_SSE_BACKOFF_MS);
+  sseBackoff.set(workspaceId, next);
   setTimeout(() => {
     if (currentSessionToken()) openStream(workspaceId);
-  }, 5_000);
+  }, next);
+}
+
+/** Called from inside the SSE read loop on the first chunk so a healthy
+ *  connection resets the backoff. */
+function resetSseBackoff(workspaceId: string) {
+  sseBackoff.delete(workspaceId);
+}
+
+/** True when the error looks like "backend isn't running / reachable" —
+ *  used to demote noisy stack traces to a single info line. We deliberately
+ *  don't include UND_ERR_SOCKET here since that one's already handled. */
+function isBackendUnreachable(err: unknown): boolean {
+  const code = (err as { cause?: { code?: string }; code?: string })?.cause?.code
+    ?? (err as { code?: string })?.code;
+  return code === 'ECONNREFUSED' || code === 'ENOTFOUND' || code === 'ECONNRESET';
 }
 
 function handleSseEvent(workspaceId: string, rawEvent: string) {
@@ -472,11 +587,21 @@ export function getSyncStatus() {
 }
 
 export async function forceSync(workspaceId?: string) {
+  // User-driven retry — clear the breaker, reschedule the periodic timers
+  // if the backend stays reachable, and kick the SSE streams back up.
+  const wasTripped = breakerTripped;
+  resetCircuitBreaker();
+  if (wasTripped && currentSessionToken()) {
+    schedulePush();
+    schedulePull();
+    openStreams();
+  }
   if (workspaceId) {
     const ws = listWorkspaces().find((w) => w.id === workspaceId);
     if (ws && !ws.localOnly) {
       await pushWorkspace(workspaceId, ws.remoteRevision);
       await pullWorkspace(workspaceId);
+      recordReachable();
     }
   } else {
     await runPushOnce();

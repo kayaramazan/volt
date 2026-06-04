@@ -30,11 +30,11 @@ export function statusColorClass(status: number | null | undefined): string {
 export function methodColorClass(method: string): string {
   switch (method.toUpperCase()) {
     case 'GET':
-      return 'text-sky-400';
-    case 'POST':
       return 'text-success';
-    case 'PUT':
+    case 'POST':
       return 'text-warning';
+    case 'PUT':
+      return 'text-sky-400';
     case 'PATCH':
       return 'text-purple-400';
     case 'DELETE':

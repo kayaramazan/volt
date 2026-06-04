@@ -1,85 +1,74 @@
-import { useQuery } from '@tanstack/react-query';
-import { AlertTriangle, X, RotateCcw } from 'lucide-react';
+// Sticky banner at the top of the workspace when one or more local edits
+// got overwritten by a teammate's sync. The conflict_log table is
+// populated by the sync engine in main; we read it via conflict:list and
+// invalidate on sync:conflictDetected events (see useSyncEvents).
+
+import { AlertTriangle, RotateCcw, X } from 'lucide-react';
 
 import { Button } from '@/components/ui/Button';
-import { voltApi } from '@/lib/volt-api';
+import { useConflicts, useDismissConflict } from '@/hooks/useData';
+import { useModals } from '@/stores/modals';
 import { formatRelativeTime } from '@/lib/util';
-
-interface ConflictRow {
-  id: string;
-  workspaceId: string;
-  table: string;
-  rowId: string;
-  previousState: unknown;
-  overwrittenByName: string;
-  overwrittenAt: number;
-  dismissedAt: number | null;
-}
 
 interface Props {
   workspaceId: string;
 }
 
-/**
- * Banner shown at the top of the main panel when one or more local changes
- * got overwritten by a teammate's sync. User can review and restore.
- *
- * The conflict log is fetched via a query that's invalidated when the sync
- * engine emits 'sync:conflictDetected' (see useSyncEvents).
- */
 export function ConflictBanner({ workspaceId }: Props) {
-  // We don't have a dedicated IPC for fetching local conflicts; the sync
-  // engine writes them to the local conflictLog table. For now we'd add a
-  // small IPC handler; here we expose via authedFetch as a placeholder.
-  // The actual implementation would call window.volt['sync:status'] which
-  // returns a conflict count; the detail comes from a follow-up query.
-  const { data: conflicts } = useQuery<ConflictRow[]>({
-    queryKey: ['conflicts', workspaceId],
-    queryFn: async () => {
-      // Conflicts come from backend's /api/sync/conflicts endpoint.
-      // The desktop's main process exposes this implicitly; for MVP we
-      // surface the count via sync-status and show a static message.
-      // Full conflict list UI is added in v1.0.
-      return [];
-    },
-    enabled: !!workspaceId,
-  });
+  const { data: conflicts } = useConflicts(workspaceId);
+  const dismiss = useDismissConflict();
+  const { open: openModal } = useModals();
 
   if (!conflicts || conflicts.length === 0) return null;
+
+  const latest = conflicts[0]!;
+  const latestAt = new Date(latest.overwrittenAt).toISOString();
 
   return (
     <div className="flex items-center gap-3 border-b border-warning/40 bg-warning/10 px-3 py-2 text-xs">
       <AlertTriangle size={14} className="shrink-0 text-warning" />
-      <div className="flex-1">
-        <p className="text-text">
-          {conflicts.length === 1 ? '1 change was' : `${conflicts.length} changes were`} overwritten by{' '}
-          <span className="text-text">{conflicts[0]?.overwrittenByName}</span>
+      <div className="flex-1 min-w-0">
+        <p className="truncate text-text">
+          {conflicts.length === 1 ? '1 of your edits was' : `${conflicts.length} of your edits were`} overwritten
+          {latest.overwrittenByName ? (
+            <>
+              {' by '}
+              <span className="font-medium">{latest.overwrittenByName}</span>
+            </>
+          ) : null}
         </p>
-        <p className="text-text-muted">
-          Most recent: {formatRelativeTime(new Date(conflicts[0]?.overwrittenAt ?? 0).toISOString())}
+        <p className="text-[11px] text-text-muted">
+          Most recent {formatRelativeTime(latestAt)} · {tableLabel(latest.table)}
         </p>
       </div>
       <Button
         size="sm"
         variant="outline"
-        onClick={async () => {
-          // Restore the most recent one
-          if (conflicts[0]) {
-            // This calls the backend; the sync engine pulls it back as a new revision.
-            // For MVP MVP, full restore UI lives in the conflict log page.
-          }
-        }}
+        onClick={() => openModal({ kind: 'conflicts', workspaceId })}
+        title="Review and optionally restore overwritten edits"
       >
         <RotateCcw size={11} />
         Review
       </Button>
       <button
         type="button"
-        className="rounded p-1 text-text-muted hover:text-text"
-        title="Dismiss"
+        onClick={() => {
+          // "Dismiss" applies only to the most recent — the rest stay so the
+          // user can still review them. Most users will click Review first.
+          void dismiss.mutate({ id: latest.id });
+        }}
+        className="rounded p-1 text-text-muted hover:bg-bg hover:text-text"
+        title="Dismiss this notice"
       >
         <X size={13} />
       </button>
     </div>
   );
+}
+
+function tableLabel(t: string): string {
+  if (t === 'collection') return 'Collection edit';
+  if (t === 'request') return 'Request edit';
+  if (t === 'environment') return 'Environment edit';
+  return t;
 }

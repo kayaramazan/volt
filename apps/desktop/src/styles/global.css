@@ -3,8 +3,9 @@
 @tailwind utilities;
 
 @layer base {
-  :root {
-    /* Volt design tokens */
+  /* Dark is the default (matches previous behaviour). */
+  :root,
+  :root.dark {
     --color-bg: 10 10 10;
     --color-bg-elevated: 23 23 23;
     --color-border: 38 38 38;
@@ -14,6 +15,17 @@
     --color-success: 34 197 94;
     --color-warning: 234 179 8;
     --color-error: 239 68 68;
+  }
+  :root.light {
+    --color-bg: 250 250 250;
+    --color-bg-elevated: 255 255 255;
+    --color-border: 229 229 229;
+    --color-text: 23 23 23;
+    --color-text-muted: 107 114 128;
+    --color-accent: 202 138 4; /* darker yellow for contrast on light */
+    --color-success: 22 163 74;
+    --color-warning: 202 138 4;
+    --color-error: 220 38 38;
   }
 
   /* Disable text selection on UI chrome, allow on content */
@@ -55,12 +67,17 @@
   background: rgb(82 82 82);
 }
 
-/* {{variable}} highlighting inside CodeMirror (body editor). */
+/* {{variable}} highlighting inside CodeMirror (body editor). Hovering opens
+   the VarEditor popup (see CodeEditor.tsx); clicks pass through to CM for
+   normal caret positioning so users can edit the var text directly. */
 .cm-volt-var {
   color: rgb(var(--color-accent));
   background: rgb(var(--color-accent) / 0.12);
   border-radius: 2px;
   padding: 0 1px;
+}
+.cm-volt-var:hover {
+  background: rgb(var(--color-accent) / 0.22);
 }
 
 /* Indeterminate progress bar for in-flight requests (ResponseViewer). */

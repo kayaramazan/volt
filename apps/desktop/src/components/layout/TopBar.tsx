@@ -8,12 +8,13 @@ import {
   CloudOff,
   Globe,
   Plus,
+  Server,
   Settings2,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/Button';
 import { Select } from '@/components/ui/Select';
-import { useAuthStatus, useEnvironments, useSetActiveEnv, useActiveEnv, useSyncStatus, useWorkspaces } from '@/hooks/useData';
+import { useAuthStatus, useEnvironments, useMockStatus, useSetActiveEnv, useActiveEnv, useSyncStatus, useWorkspaces } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
 import { useModals } from '@/stores/modals';
 import { voltApi } from '@/lib/volt-api';
@@ -47,7 +48,9 @@ export function TopBar() {
     })),
     ...(workspaces?.team ?? []).map((w) => ({
       value: w.id,
-      label: `${w.name} · ${w.ownerTeam?.name ?? 'Team'}`,
+      // The list response from the local DB only carries `ownerTeamId`, not
+      // the team name (Postgres-side joined query lands in v1.1).
+      label: `${w.name} · Team`,
     })),
   ];
 
@@ -129,6 +132,7 @@ export function TopBar() {
 
       <div className="flex items-center gap-2">
         <SyncIndicator status={syncStatus} loggedIn={authStatus?.loggedIn ?? false} />
+        <MockIndicator />
 
         <Button
           size="sm"
@@ -160,6 +164,9 @@ function SyncIndicator({
   status: { state?: string; pendingChanges?: number } | undefined;
   loggedIn: boolean;
 }) {
+  const { workspaceId } = useSelection();
+  const { open: openModal } = useModals();
+
   if (!loggedIn) {
     return (
       <div
@@ -184,17 +191,61 @@ function SyncIndicator({
 
   const c = config[state as keyof typeof config] ?? config.offline;
 
+  // In the conflict state, clicking the pill opens the resolution modal
+  // instead of triggering another sync (which won't clear the conflict
+  // until the user picks restore-or-dismiss for each row).
+  const isConflict = state === 'conflict';
+  const onClick = () => {
+    if (isConflict && workspaceId) {
+      openModal({ kind: 'conflicts', workspaceId });
+    } else {
+      void voltApi['sync:force']({});
+    }
+  };
+
   return (
     <button
       type="button"
-      onClick={() => voltApi['sync:force']({})}
+      onClick={onClick}
       className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs hover:bg-bg ${c.cls}`}
-      title={`${c.label}${pending ? ` · ${pending} pending` : ''}. Click to force sync.`}
+      title={
+        isConflict
+          ? 'Click to review and resolve conflicts.'
+          : `${c.label}${pending ? ` · ${pending} pending` : ''}. Click to force sync.`
+      }
     >
       {c.icon}
       <span>{c.label}</span>
       {pending > 0 && (
         <span className="rounded bg-warning/20 px-1 text-warning">{pending}</span>
+      )}
+    </button>
+  );
+}
+
+function MockIndicator() {
+  const { data: status } = useMockStatus();
+  const { open: openModal } = useModals();
+  const running = !!status?.running;
+  return (
+    <button
+      type="button"
+      onClick={() => openModal({ kind: 'mock-settings' })}
+      className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs hover:bg-bg ${
+        running ? 'text-success' : 'text-text-muted'
+      }`}
+      title={
+        running
+          ? `Mock server running on :${status?.port} · ${status?.activeMockCount ?? 0} active`
+          : 'Mock server stopped — click to start'
+      }
+    >
+      <Server size={12} />
+      <span>{running ? `Mocks :${status?.port}` : 'Mocks off'}</span>
+      {running && (status?.activeMockCount ?? 0) > 0 && (
+        <span className="rounded bg-success/20 px-1 text-success">
+          {status?.activeMockCount}
+        </span>
       )}
     </button>
   );

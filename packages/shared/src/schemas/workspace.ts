@@ -66,6 +66,30 @@ export const Workspace = z.object({
 // Collections
 // ─────────────────────────────────────────────────────────
 
+// Mock-server entry attached to a collection. The local mock server (see
+// electron/core/mock/server.ts) walks every collection's `mocks[]` and
+// answers matching HTTP requests with the configured status/headers/body.
+export const MockDefinition = z.object({
+  id: z.string(),
+  name: z.string().default(''),
+  /** HTTP method to match. Use '*' to match any method. */
+  method: z.string().default('GET'),
+  /** Path pattern. `:name` segments match a single non-slash segment;
+   *  `*` matches the rest of the path. Anchored to the start of the URL.
+   *  Example: `/users/:id` matches `/users/123` but not `/users/123/posts`. */
+  pathPattern: z.string().default('/'),
+  enabled: z.boolean().default(true),
+  status: z.number().int().min(100).max(599).default(200),
+  headers: z
+    .array(z.object({ key: z.string(), value: z.string() }))
+    .default([]),
+  contentType: z.string().default('application/json'),
+  body: z.string().default(''),
+  /** Artificial latency before sending the response. */
+  delayMs: z.number().int().min(0).max(60_000).default(0),
+});
+export type MockDefinition = z.infer<typeof MockDefinition>;
+
 export const Collection = z.object({
   id: uuid,
   workspaceId: uuid,
@@ -76,6 +100,7 @@ export const Collection = z.object({
   description: z.string().max(200_000).default(''),
   sortOrder: z.number().int().default(0),
   variables: z.array(Variable).default([]),
+  mocks: z.array(MockDefinition).default([]),
   // Only set when the row was loaded from server (not for local-only).
   revision: z.string().optional(),
 });

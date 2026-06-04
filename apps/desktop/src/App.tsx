@@ -3,11 +3,13 @@ import { useState, useEffect } from 'react';
 import { TopBar } from '@/components/layout/TopBar';
 import { Workspace } from '@/pages/Workspace';
 import { AuthScreen } from '@/pages/AuthScreen';
+import { WelcomePage } from '@/pages/WelcomePage';
 import { useAuthStatus, useWorkspaces } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
 import { useModals } from '@/stores/modals';
 import { useHotkey } from '@/hooks/useHotkey';
 import { useSyncEvents } from '@/hooks/useSyncEvents';
+import { useMenuEvents } from '@/hooks/useMenuEvents';
 
 // Modals
 import { NewWorkspaceModal } from '@/components/modals/NewWorkspaceModal';
@@ -22,8 +24,19 @@ import { TeamsModal } from '@/components/modals/TeamsModal';
 import { CollectionDocsModal } from '@/components/modals/CollectionDocsModal';
 import { RequestDocsModal } from '@/components/modals/RequestDocsModal';
 import { AddExampleModal } from '@/components/modals/AddExampleModal';
+import { CodeGenModal } from '@/components/modals/CodeGenModal';
+import { ExportCollectionModal } from '@/components/modals/ExportCollectionModal';
+import { GlobalSearchModal } from '@/components/modals/GlobalSearchModal';
+import { ResponseDiffModal } from '@/components/modals/ResponseDiffModal';
+import { WebSocketModal } from '@/components/modals/WebSocketModal';
+import { ChainModal } from '@/components/modals/ChainModal';
+import { CollectionMocksModal } from '@/components/modals/CollectionMocksModal';
+import { MockSettingsModal } from '@/components/modals/MockSettingsModal';
+import { PluginsModal } from '@/components/modals/PluginsModal';
+import { ConflictsModal } from '@/components/modals/ConflictsModal';
 
 const OFFLINE_SKIP_KEY = 'volt:offline-skip';
+const ONBOARDED_KEY = 'volt:onboarded';
 
 /**
  * Top-level routing:
@@ -34,27 +47,42 @@ const OFFLINE_SKIP_KEY = 'volt:offline-skip';
  */
 export function App() {
   const { data: authStatus, isLoading } = useAuthStatus();
-  const { workspaceId, setWorkspaceId } = useSelection();
+  const { workspaceId, setWorkspaceId, selectRequest } = useSelection();
   const { data: workspaces } = useWorkspaces();
   const { open: openModal } = useModals();
 
   const [offlineSkip, setOfflineSkip] = useState<boolean>(() => {
     return localStorage.getItem(OFFLINE_SKIP_KEY) === 'true';
   });
+  const [onboarded, setOnboarded] = useState<boolean>(() => {
+    return localStorage.getItem(ONBOARDED_KEY) === 'true';
+  });
 
-  // Reset the offline-skip when the user signs out (dispatched by useSignOut)
-  // so the auth gate reappears.
+  // Reset the offline-skip + onboarded flag when the user signs out so a
+  // fresh sign-in elsewhere brings the welcome flow back. (Onboarded is
+  // device-scoped; the explicit signOut intent is the natural reset point.)
   useEffect(() => {
-    const handler = () => setOfflineSkip(false);
+    const handler = () => {
+      setOfflineSkip(false);
+      // Onboarded stays true after a sign-out — once a user knows the app,
+      // we don't show the welcome again. The auth gate handles re-entry.
+    };
     window.addEventListener('volt:signed-out', handler);
     return () => window.removeEventListener('volt:signed-out', handler);
   }, []);
 
+  function markOnboarded() {
+    localStorage.setItem(ONBOARDED_KEY, 'true');
+    setOnboarded(true);
+  }
+
   // Wire up sync event broadcasting → query invalidation
   useSyncEvents();
+  useMenuEvents();
 
   // Global keyboard shortcuts
   useHotkey('mod+k', () => openModal({ kind: 'command-palette' }));
+  useHotkey('mod+p', () => openModal({ kind: 'global-search' }));
   useHotkey('mod+n', () => openModal({ kind: 'new-request', collectionId: null }));
   useHotkey('mod+,', () => openModal({ kind: 'settings' }), { allowInInputs: true });
 
@@ -67,6 +95,47 @@ export function App() {
 
   if (isLoading) {
     return <div className="flex h-full items-center justify-center text-xs text-text-muted">Loading…</div>;
+  }
+
+  // First-launch welcome: signed-out user with no local workspaces who
+  // hasn't dismissed onboarding yet. Once they pick a path (import / start
+  // fresh / sign in / skip) we set ONBOARDED_KEY and never show it again.
+  const hasAnyWorkspace =
+    (workspaces?.personal.length ?? 0) + (workspaces?.team.length ?? 0) > 0;
+  const showWelcome = !authStatus?.loggedIn && !onboarded && !hasAnyWorkspace;
+  if (showWelcome) {
+    return (
+      <WelcomePage
+        onImport={() => {
+          // Mark onboarded immediately — the auth gate would otherwise jump
+          // in front of the import modal as soon as state changes.
+          localStorage.setItem(OFFLINE_SKIP_KEY, 'true');
+          setOfflineSkip(true);
+          markOnboarded();
+          openModal({ kind: 'import' });
+        }}
+        onSignIn={() => {
+          // Falls through to the auth gate below by clearing offlineSkip
+          // and recording that onboarding is over.
+          localStorage.removeItem(OFFLINE_SKIP_KEY);
+          setOfflineSkip(false);
+          markOnboarded();
+        }}
+        onSkip={() => {
+          localStorage.setItem(OFFLINE_SKIP_KEY, 'true');
+          setOfflineSkip(true);
+          markOnboarded();
+        }}
+        onSeedDone={(_wsId, requestId) => {
+          // Workspace + sample request are already created; jump straight
+          // into the editor so the user lands on something runnable.
+          localStorage.setItem(OFFLINE_SKIP_KEY, 'true');
+          setOfflineSkip(true);
+          markOnboarded();
+          selectRequest(requestId);
+        }}
+      />
+    );
   }
 
   // First-run gate: prompt for sign in or offline mode
@@ -108,6 +177,16 @@ export function App() {
       <CollectionDocsModal />
       <RequestDocsModal />
       <AddExampleModal />
+      <CodeGenModal />
+      <ExportCollectionModal />
+      <GlobalSearchModal />
+      <ResponseDiffModal />
+      <WebSocketModal />
+      <ChainModal />
+      <CollectionMocksModal />
+      <MockSettingsModal />
+      <PluginsModal />
+      <ConflictsModal />
     </div>
   );
 }

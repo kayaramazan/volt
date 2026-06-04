@@ -14,6 +14,8 @@ import path from 'node:path';
 import { closeDb, getDb } from './core/db/connection';
 import { restoreSession } from './core/auth/manager';
 import { registerIpcHandlers } from './ipc/handlers';
+import { bootMockServer } from './core/mock/server';
+import { loadAllPlugins } from './core/plugins/runtime';
 import { startSync, stopSync } from './core/sync/engine';
 
 const isDev = !app.isPackaged;
@@ -91,6 +93,22 @@ app.whenReady().then(async () => {
   setTimeout(() => {
     startSync();
   }, 2000);
+
+  // Mock server boots on the same timer iff the user previously left it on.
+  setTimeout(() => {
+    void bootMockServer();
+  }, 2500);
+
+  // Plugins are cheap to load (just synchronous vm evals), so we do them
+  // eagerly so the renderer has the list available the moment a user opens
+  // the Plugins panel or the Transform dropdown.
+  try {
+    loadAllPlugins();
+  } catch {
+    // Failure is non-fatal — the plugin folder might not exist yet on a
+    // fresh install. The Plugins modal will show "0 loaded" and the user
+    // can hit Reload after dropping files in.
+  }
 });
 
 function createMainWindow() {
@@ -114,10 +132,10 @@ function createMainWindow() {
     },
   });
 
-  // Set up minimal menu in non-dev (or replace with full custom menu later)
-  if (!isDev && process.platform !== 'darwin') {
-    Menu.setApplicationMenu(null);
-  }
+  // Install a custom menu so we can override Cmd/Ctrl+W to close the active
+  // tab instead of the window. We also wire Cmd/Ctrl+Shift+W to "Close window"
+  // for parity with browser conventions.
+  installAppMenu(mainWindow);
 
   // Load app
   if (VITE_DEV_SERVER_URL) {
@@ -151,4 +169,92 @@ function createMainWindow() {
       event.preventDefault();
     }
   });
+}
+
+/**
+ * Custom application menu. Replaces the default macOS Cmd+W "Close Window"
+ * with a Cmd+W "Close Tab" that dispatches a `volt:event` to the renderer.
+ * Cmd+Shift+W keeps the window-close path available.
+ */
+function installAppMenu(win: BrowserWindow) {
+  const isMac = process.platform === 'darwin';
+  const sendCloseTab = () => {
+    win.webContents.send('volt:event', { kind: 'menu:close-current-tab' });
+  };
+
+  const fileSubmenu: Electron.MenuItemConstructorOptions[] = [
+    {
+      label: 'Close Tab',
+      accelerator: 'CommandOrControl+W',
+      click: sendCloseTab,
+    },
+    {
+      label: 'Close Window',
+      accelerator: 'CommandOrControl+Shift+W',
+      role: 'close',
+    },
+  ];
+
+  const template: Electron.MenuItemConstructorOptions[] = [];
+  if (isMac) {
+    template.push({
+      label: app.name,
+      submenu: [
+        { role: 'about' },
+        { type: 'separator' },
+        { role: 'services' },
+        { type: 'separator' },
+        { role: 'hide' },
+        { role: 'hideOthers' },
+        { role: 'unhide' },
+        { type: 'separator' },
+        { role: 'quit' },
+      ],
+    });
+  }
+
+  template.push({ label: 'File', submenu: fileSubmenu });
+  template.push({
+    label: 'Edit',
+    submenu: [
+      { role: 'undo' },
+      { role: 'redo' },
+      { type: 'separator' },
+      { role: 'cut' },
+      { role: 'copy' },
+      { role: 'paste' },
+      { role: 'selectAll' },
+    ],
+  });
+  template.push({
+    label: 'View',
+    submenu: [
+      { role: 'reload' },
+      { role: 'forceReload' },
+      { role: 'toggleDevTools' },
+      { type: 'separator' },
+      { role: 'resetZoom' },
+      { role: 'zoomIn' },
+      { role: 'zoomOut' },
+      { type: 'separator' },
+      { role: 'togglefullscreen' },
+    ],
+  });
+  template.push({
+    label: 'Window',
+    submenu: [
+      { role: 'minimize' },
+      { role: 'zoom' },
+      ...(isMac
+        ? [
+            { type: 'separator' as const },
+            { role: 'front' as const },
+            { type: 'separator' as const },
+            { role: 'window' as const },
+          ]
+        : [{ role: 'close' as const }]),
+    ],
+  });
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }

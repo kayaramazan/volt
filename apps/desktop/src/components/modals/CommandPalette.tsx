@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Command } from 'cmdk';
-import { Search, FileText, FolderPlus, Upload, Settings, LogOut } from 'lucide-react';
+import { Globe, Plug, Puzzle, Search, FileText, FolderPlus, Link2, Upload, Settings, LogOut } from 'lucide-react';
 
 import { useRequests, useCollections, useSignOut } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
@@ -112,7 +112,7 @@ export function CommandPalette() {
             <span>New collection</span>
           </Command.Item>
           <Command.Item
-            value="import postman insomnia openapi curl"
+            value="import postman insomnia openapi curl har"
             onSelect={() => {
               close();
               open({ kind: 'import' });
@@ -121,6 +121,62 @@ export function CommandPalette() {
           >
             <Upload size={13} />
             <span>Import…</span>
+          </Command.Item>
+          <Command.Item
+            value="search requests global fuzzy"
+            onSelect={() => {
+              close();
+              open({ kind: 'global-search' });
+            }}
+            className="cmd-item"
+          >
+            <Search size={13} />
+            <span>Search requests…</span>
+            <kbd className="ml-auto text-[10px] text-text-muted">⌘P</kbd>
+          </Command.Item>
+          <Command.Item
+            value="websocket ws scratchpad"
+            onSelect={() => {
+              close();
+              open({ kind: 'websocket' });
+            }}
+            className="cmd-item"
+          >
+            <Plug size={13} />
+            <span>WebSocket scratchpad…</span>
+          </Command.Item>
+          <Command.Item
+            value="chain runner request flow"
+            onSelect={() => {
+              close();
+              open({ kind: 'chain' });
+            }}
+            className="cmd-item"
+          >
+            <Link2 size={13} />
+            <span>Request chain…</span>
+          </Command.Item>
+          <Command.Item
+            value="globals view environment variables"
+            onSelect={() => {
+              close();
+              open({ kind: 'globals' });
+            }}
+            className="cmd-item"
+          >
+            <Globe size={13} />
+            <span>Globals…</span>
+          </Command.Item>
+          <Command.Item
+            value="plugins extensions transformers"
+            onSelect={() => {
+              close();
+              open({ kind: 'plugins' });
+            }}
+            className="cmd-item"
+          >
+            <Puzzle size={13} />
+            <span>Plugins…</span>
           </Command.Item>
           <Command.Item
             value="settings preferences"

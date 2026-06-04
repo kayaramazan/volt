@@ -176,6 +176,13 @@ function applyAuth(
       }
       return;
     }
+    case 'oauth2': {
+      // OAuth lookup is async; the resolver itself is sync. We don't fetch
+      // here — IPC handler does it before calling executeRequest and injects
+      // the token via `Authorization: <prefix> <token>`. So at resolve time
+      // we leave the header empty; the engine layer will set it.
+      return;
+    }
   }
 }
 
@@ -211,5 +218,17 @@ function resolveBody(body: RequestBody, subst: (s: string) => string): ResolvedR
       };
     case 'binary':
       return { type: 'binary', filePath: body.filePath };
+    case 'graphql':
+      return {
+        type: 'graphql',
+        query: subst((body as { query?: string }).query ?? ''),
+        variables: subst((body as { variables?: string }).variables ?? ''),
+        operationName: (body as { operationName?: string }).operationName,
+      } as never;
+    case 'grpc':
+      // gRPC requests don't flow through the HTTP resolver — they have a
+      // dedicated path in the renderer (GrpcRequestEditor) that calls the
+      // grpc:invoke IPC directly. Hitting this branch is a bug.
+      throw new Error('gRPC requests must be sent via grpc:invoke, not request:send.');
   }
 }

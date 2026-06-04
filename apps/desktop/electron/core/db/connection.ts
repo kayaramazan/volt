@@ -88,6 +88,7 @@ function runMigrations(raw: Database.Database) {
       description TEXT NOT NULL DEFAULT '',
       sort_order INTEGER NOT NULL DEFAULT 0,
       variables TEXT NOT NULL DEFAULT '[]',
+      mocks TEXT NOT NULL DEFAULT '[]',
       dirty INTEGER NOT NULL DEFAULT 0,
       remote_revision TEXT NOT NULL DEFAULT '0',
       deleted_at INTEGER,
@@ -229,6 +230,14 @@ function runMigrations(raw: Database.Database) {
   }
   if (!reqCols2.some((c) => c.name === 'examples')) {
     raw.exec(`ALTER TABLE api_requests ADD COLUMN examples TEXT NOT NULL DEFAULT '[]'`);
+  }
+
+  // v6: collections.mocks (local mock-server entries scoped per collection).
+  const colCols2 = raw
+    .prepare(`PRAGMA table_info('collections')`)
+    .all() as Array<{ name: string }>;
+  if (!colCols2.some((c) => c.name === 'mocks')) {
+    raw.exec(`ALTER TABLE collections ADD COLUMN mocks TEXT NOT NULL DEFAULT '[]'`);
   }
 }
 

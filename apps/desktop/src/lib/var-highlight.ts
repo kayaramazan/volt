@@ -7,7 +7,8 @@ export const VAR_REGEX = /\{\{\s*([\w.-]+)\s*\}\}/g;
 
 /**
  * CodeMirror extension that wraps `{{name}}` in a styled span. Pair with the
- * `.cm-volt-var` rule in global.css.
+ * `.cm-volt-var` rule in global.css. Clicks on these spans are caught by
+ * CodeEditor.tsx (domEventHandlers) which opens the inline VarEditor popup.
  */
 export const voltVarHighlight = ViewPlugin.fromClass(
   class {

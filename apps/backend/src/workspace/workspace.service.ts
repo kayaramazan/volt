@@ -34,6 +34,8 @@ export class WorkspaceService {
   async create(userId: string, name: string, teamId?: string, id?: string) {
     if (teamId) {
       await this.teams.assertMember(userId, teamId);
+      // Plan-limit gate — block once the team is at its workspace cap.
+      await this.teams.assertCanAddWorkspace(teamId);
       return prisma.workspace.create({
         data: { ...(id ? { id } : {}), name, ownerTeamId: teamId },
       });
@@ -93,6 +95,8 @@ export class WorkspaceService {
       throw new AppError('WORKSPACE_NOT_FOUND', 403, 'Only the owner can move a workspace.');
     }
     await this.teams.assertMember(userId, teamId);
+    // Plan-limit gate — moving in counts the same as creating a new one.
+    await this.teams.assertCanAddWorkspace(teamId);
 
     return prisma.workspace.update({
       where: { id: workspaceId },
