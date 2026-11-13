@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { ChevronRight, GripVertical, Plus, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ChevronRight, GripVertical, Plus, RotateCcw, Trash2 } from 'lucide-react';
 
 import { Button } from '@/components/ui/Button';
 import { HeaderKeyInput } from '@/components/ui/HeaderKeyInput';
@@ -19,26 +19,66 @@ export function AutoHeadersEditor() {
   const setAll = useSetAutoHeaders();
   const [draft, setDraft] = useState<AutoHeader[]>([]);
   const [open, setOpen] = useState(false);
+  const saveTimerRef = useRef<number | null>(null);
+  const pendingRef = useRef<AutoHeader[] | null>(null);
 
   useEffect(() => {
-    if (data) setDraft(data);
+    // Don't clobber in-progress edits with a refetch that is already stale.
+    if (data && !pendingRef.current && !setAll.isPending) setDraft(data);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [data]);
+
+  // Debounced persist. Rows with an empty name are kept locally (so the user
+  // can fill them in) but dropped from what we store: the IPC contract
+  // requires a non-empty key and would otherwise reject the whole list.
+  const persist = useCallback(
+    (next: AutoHeader[]) => {
+      pendingRef.current = next;
+      if (saveTimerRef.current != null) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = window.setTimeout(() => {
+        saveTimerRef.current = null;
+        const items = (pendingRef.current ?? []).filter((h) => h.key.trim().length > 0);
+        pendingRef.current = null;
+        void setAll.mutateAsync(items);
+      }, 300);
+    },
+    [setAll],
+  );
+  useEffect(() => {
+    return () => {
+      if (saveTimerRef.current != null) clearTimeout(saveTimerRef.current);
+      const items = (pendingRef.current ?? []).filter((h) => h.key.trim().length > 0);
+      if (pendingRef.current) void setAll.mutateAsync(items);
+      pendingRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   function patch(i: number, p: Partial<AutoHeader>) {
     const next = draft.slice();
     const cur = next[i];
     if (!cur) return;
+    // Built-ins keep their name; value/enabled remain editable.
+    if (cur.builtin && p.key !== undefined && p.key !== cur.key) delete p.key;
     next[i] = { ...cur, ...p };
     setDraft(next);
-    void setAll.mutateAsync(next);
+    persist(next);
   }
   function remove(i: number) {
+    if (draft[i]?.builtin) return;
     const next = draft.filter((_, j) => j !== i);
     setDraft(next);
-    void setAll.mutateAsync(next);
+    persist(next);
   }
   function add() {
     setDraft([...draft, { key: '', value: '', enabled: true } as AutoHeader]);
+  }
+  function resetToDefaults() {
+    if (!window.confirm('Reset default headers to the built-in list? Custom entries will be removed.')) return;
+    if (saveTimerRef.current != null) clearTimeout(saveTimerRef.current);
+    pendingRef.current = null;
+    // An empty list tells main to drop the stored override and return defaults.
+    void setAll.mutateAsync([]);
   }
 
   const enabledCount = draft.filter((h) => h.enabled && h.key).length;
@@ -104,10 +144,14 @@ export function AutoHeadersEditor() {
               )}
             </div>
           ))}
-          <div className="border-t border-border/40 px-1 py-1">
+          <div className="flex items-center gap-1 border-t border-border/40 px-1 py-1">
             <Button size="sm" variant="ghost" onClick={add}>
               <Plus size={11} />
               Add default header
+            </Button>
+            <Button size="sm" variant="ghost" onClick={resetToDefaults} className="ml-auto" title="Restore the built-in defaults">
+              <RotateCcw size={11} />
+              Reset to defaults
             </Button>
           </div>
         </div>

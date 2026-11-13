@@ -19,8 +19,19 @@ interface SelectionState {
   responsePanelOpen: boolean;
   /** Whether the left (sidebar) panel is visible */
   sidebarOpen: boolean;
+  /** Which sidebar pane is showing (persisted so it survives workspace switches). */
+  sidebarTab: 'collections' | 'history';
 
   setWorkspaceId: (id: string | null) => void;
+  setSidebarTab: (tab: 'collections' | 'history') => void;
+  /** Move the tab at `from` to index `to` (drag-and-drop reorder). */
+  reorderTab: (from: number, to: number) => void;
+  /**
+   * Drop any open tab whose request no longer exists (deleted locally, via
+   * sync, or the collection it lived in was removed). Keeps the active tab
+   * valid — falls back to the last remaining tab or none.
+   */
+  pruneTabs: (existingIds: Set<string>) => void;
   selectRequest: (id: string | null) => void;
   /** Select a request and focus a specific example inside it. */
   selectExample: (requestId: string, exampleId: string) => void;
@@ -42,10 +53,33 @@ export const useSelection = create<SelectionState>()(
       selectedExampleId: null,
       responsePanelOpen: true,
       sidebarOpen: true,
+      sidebarTab: 'collections',
 
       setWorkspaceId: (id) => {
+        // No-op when already selected — otherwise we'd close every tab for
+        // nothing (e.g. global search picking a request in the current workspace).
+        if (get().workspaceId === id) return;
         // Changing workspace closes all open tabs from the previous one
         set({ workspaceId: id, requestId: null, openTabs: [], selectedExampleId: null });
+      },
+      setSidebarTab: (tab) => set({ sidebarTab: tab }),
+      reorderTab: (from, to) => {
+        const tabs = [...get().openTabs];
+        if (from === to || from < 0 || to < 0 || from >= tabs.length || to >= tabs.length) return;
+        const [moved] = tabs.splice(from, 1);
+        tabs.splice(to, 0, moved!);
+        set({ openTabs: tabs });
+      },
+      pruneTabs: (existingIds) => {
+        const { openTabs, requestId, selectedExampleId } = get();
+        const tabs = openTabs.filter((t) => existingIds.has(t));
+        if (tabs.length === openTabs.length) return;
+        const activeGone = requestId !== null && !existingIds.has(requestId);
+        set({
+          openTabs: tabs,
+          requestId: activeGone ? (tabs[tabs.length - 1] ?? null) : requestId,
+          selectedExampleId: activeGone ? null : selectedExampleId,
+        });
       },
       selectRequest: (id) => {
         if (!id) {
@@ -96,6 +130,7 @@ export const useSelection = create<SelectionState>()(
         selectedExampleId: state.selectedExampleId,
         responsePanelOpen: state.responsePanelOpen,
         sidebarOpen: state.sidebarOpen,
+        sidebarTab: state.sidebarTab,
       }),
     },
   ),

@@ -46,11 +46,15 @@ export function HeaderKeyInput({
   const [active, setActive] = useState(0);
   const wrapperRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // True once the user moved the highlight with the arrow keys. Enter on an
+  // untouched, empty input must not silently insert the first common header.
+  const navigatedRef = useRef(false);
 
   const suggestions = useMemo(() => (open ? suggestHeaders(value, 8) : []), [open, value]);
 
   useEffect(() => {
     setActive(0);
+    navigatedRef.current = false;
   }, [value]);
 
   // Close on outside click.
@@ -82,11 +86,14 @@ export function HeaderKeyInput({
     if (!open || suggestions.length === 0) return;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
+      navigatedRef.current = true;
       setActive((a) => (a + 1) % suggestions.length);
     } else if (e.key === 'ArrowUp') {
       e.preventDefault();
+      navigatedRef.current = true;
       setActive((a) => (a - 1 + suggestions.length) % suggestions.length);
     } else if (e.key === 'Enter') {
+      if (!value.trim() && !navigatedRef.current) return;
       e.preventDefault();
       const choice = suggestions[active];
       if (choice) pick(choice);

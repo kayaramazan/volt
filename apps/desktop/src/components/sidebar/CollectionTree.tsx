@@ -1,5 +1,5 @@
-import { createContext, useContext, useMemo, useState, type DragEvent, type MouseEvent } from 'react';
-import { BookText, ChevronRight, Copy, Download, FileCode2, FolderPlus, Folder, FileText, FilePlus2, MoreHorizontal, Search, Server, Trash2, X } from 'lucide-react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type DragEvent, type KeyboardEvent, type MouseEvent } from 'react';
+import { BookText, ChevronRight, Copy, Download, FileCode2, FolderPlus, Folder, FileText, FilePlus2, MoreHorizontal, Pencil, Search, Server, Trash2, X, Zap, ZapOff } from 'lucide-react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
 import { useQueryClient } from '@tanstack/react-query';
 
@@ -9,12 +9,17 @@ import {
   useCollections,
   useDeleteCollection,
   useDeleteRequest,
+  useDuplicateCollection,
   useDuplicateRequest,
   useRequests,
+  useSetWidgetFavorite,
+  useUpdateCollection,
   useUpdateRequest,
+  useWidgetFavorites,
 } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
 import { useModals } from '@/stores/modals';
+import { toast } from '@/stores/toasts';
 
 interface Props {
   workspaceId: string;
@@ -83,6 +88,8 @@ interface TreeCtx {
   visibleCollections: Set<string>;
   /** Request ids that should render. */
   visibleRequests: Set<string>;
+  /** Collection ids on the path from the root to the active request. */
+  activeAncestors: Set<string>;
 }
 
 const TreeContext = createContext<TreeCtx | null>(null);
@@ -169,6 +176,23 @@ export function CollectionTree({ workspaceId }: Props) {
     return { visibleCollections: collectionMatch, visibleRequests: reqMatch };
   }, [collections, requests, searching, searchTerm, collectionsByParent, requestsByCollection]);
 
+  // Folders that contain the active request (directly or nested). Used to
+  // auto-expand the path to it and to tint those folder rows.
+  const activeRequestId = useSelection((s) => s.requestId);
+  const activeAncestors = useMemo(() => {
+    const out = new Set<string>();
+    const req = ((requests ?? []) as RequestNode[]).find((r) => r.id === activeRequestId);
+    if (!req) return out;
+    const parentOf = new Map<string, string | null>();
+    for (const c of (collections ?? []) as CollectionNode[]) parentOf.set(c.id, c.parentId ?? null);
+    let cur = req.collectionId ?? null;
+    while (cur && !out.has(cur)) {
+      out.add(cur);
+      cur = parentOf.get(cur) ?? null;
+    }
+    return out;
+  }, [requests, collections, activeRequestId]);
+
   // Move helpers — append to end of destination by giving the highest sortOrder.
   function nextSortOrder(parentRequests: RequestNode[] = []) {
     return parentRequests.reduce((m, r) => Math.max(m, r.sortOrder ?? 0), -1) + 1;
@@ -198,9 +222,11 @@ export function CollectionTree({ workspaceId }: Props) {
         id: requestId,
         collectionId: toCollectionId,
         sortOrder: newSortOrder,
-      } as never).finally(() => {
-        qc.invalidateQueries({ queryKey: ['requests'] });
-      });
+      } as never)
+        .catch((err) => toast.error('Could not move request', err))
+        .finally(() => {
+          qc.invalidateQueries({ queryKey: ['requests'] });
+        });
     },
     wouldCycle: (collectionId, newParentId) => {
       // Walk newParent → its parent → ... ; cycle iff we encounter collectionId.
@@ -232,9 +258,11 @@ export function CollectionTree({ workspaceId }: Props) {
         id: collectionId,
         parentId: newParentId,
         sortOrder: newSortOrder,
-      } as never).finally(() => {
-        qc.invalidateQueries({ queryKey: ['collections'] });
-      });
+      } as never)
+        .catch((err) => toast.error('Could not move collection', err))
+        .finally(() => {
+          qc.invalidateQueries({ queryKey: ['collections'] });
+        });
     },
     // Drop a request before/after another request. Renumbers siblings in
     // the target parent + writes a new sortOrder per row. Uses an
@@ -306,9 +334,11 @@ export function CollectionTree({ workspaceId }: Props) {
             sortOrder: u.sortOrder,
           } as never),
         ),
-      ).finally(() => {
-        qc.invalidateQueries({ queryKey: ['requests'] });
-      });
+      )
+        .catch((err) => toast.error('Could not reorder requests', err))
+        .finally(() => {
+          qc.invalidateQueries({ queryKey: ['requests'] });
+        });
     },
     reorderCollectionNear: (collectionId, targetCollectionId, side) => {
       if (collectionId === targetCollectionId) return;
@@ -376,13 +406,16 @@ export function CollectionTree({ workspaceId }: Props) {
             sortOrder: u.sortOrder,
           } as never),
         ),
-      ).finally(() => {
-        qc.invalidateQueries({ queryKey: ['collections'] });
-      });
+      )
+        .catch((err) => toast.error('Could not reorder collections', err))
+        .finally(() => {
+          qc.invalidateQueries({ queryKey: ['collections'] });
+        });
     },
     searching,
     visibleCollections,
     visibleRequests,
+    activeAncestors,
   };
 
   const searchBar = (
@@ -497,6 +530,9 @@ function CollectionItem({
   const [dropZone, setDropZone] = useState<'above' | 'into' | 'below' | null>(null);
   const { open: openModal } = useModals();
   const deleteCollection = useDeleteCollection();
+  const updateCollection = useUpdateCollection();
+  const duplicateCollection = useDuplicateCollection();
+  const [renaming, setRenaming] = useState(false);
   const tree = useTree();
 
   // While searching, force-expand and only render visible descendants.
@@ -509,6 +545,14 @@ function CollectionItem({
     ? allChildRequests.filter((r) => tree.visibleRequests.has(r.id))
     : allChildRequests;
   const expanded = tree.searching ? true : open;
+  const onActivePath = tree.activeAncestors.has(collection.id);
+  const activeRequestId = useSelection((s) => s.requestId);
+  // Reveal the active request: open every folder on its path whenever the
+  // active request changes (the user can still collapse it afterwards).
+  useEffect(() => {
+    if (onActivePath) setOpen(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeRequestId, onActivePath]);
 
   function handleDragStart(e: DragEvent) {
     e.stopPropagation();
@@ -585,18 +629,33 @@ function CollectionItem({
         {dropZone === 'below' && (
           <span className="pointer-events-none absolute inset-x-1 -bottom-px h-0.5 rounded-full bg-accent" />
         )}
-        <button
-          type="button"
-          onClick={() => setOpen(!open)}
-          className="flex flex-1 items-center gap-1.5 truncate text-left text-13"
-        >
-          <ChevronRight
-            size={12}
-            className={cn('text-text-muted transition-transform', expanded && 'rotate-90')}
+        {renaming ? (
+          <InlineRename
+            initial={collection.name}
+            icon={<Folder size={13} className="text-text-muted" />}
+            onCancel={() => setRenaming(false)}
+            onCommit={(name) => {
+              setRenaming(false);
+              if (name !== collection.name) updateCollection.mutate({ id: collection.id, name });
+            }}
           />
-          <Folder size={13} className="text-text-muted" />
-          <span className="truncate text-text">{collection.name}</span>
-        </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setOpen(!open)}
+            onDoubleClick={() => setRenaming(true)}
+            className="flex flex-1 items-center gap-1.5 truncate text-left text-13"
+          >
+            <ChevronRight
+              size={12}
+              className={cn('text-text-muted transition-transform', expanded && 'rotate-90')}
+            />
+            <Folder size={13} className={onActivePath ? 'text-accent' : 'text-text-muted'} />
+            <span className={cn('truncate text-text', onActivePath && 'font-medium')}>
+              {collection.name}
+            </span>
+          </button>
+        )}
 
         <ItemMenu
           actions={[
@@ -609,6 +668,16 @@ function CollectionItem({
               label: 'New sub-folder',
               icon: <FolderPlus size={13} />,
               onClick: () => openModal({ kind: 'new-collection', parentId: collection.id }),
+            },
+            {
+              label: 'Rename',
+              icon: <Pencil size={13} />,
+              onClick: () => setRenaming(true),
+            },
+            {
+              label: 'Duplicate',
+              icon: <Copy size={13} />,
+              onClick: () => duplicateCollection.mutate(collection.id),
             },
             {
               label: 'Documentation',
@@ -676,9 +745,25 @@ function RequestItem({
   const { requestId, selectRequest } = useSelection();
   const deleteRequest = useDeleteRequest();
   const duplicate = useDuplicateRequest();
+  const updateRequest = useUpdateRequest();
+  const [renaming, setRenaming] = useState(false);
   const { open: openModal } = useModals();
   const active = requestId === request.id;
+  const { data: widget } = useWidgetFavorites();
+  const setWidgetFavorite = useSetWidgetFavorite();
+  const inWidget = widget?.requestIds.includes(request.id) ?? false;
   const tree = useTree();
+  const rowRef = useRef<HTMLDivElement>(null);
+  // Scroll the active row into view when it becomes active (tab switch,
+  // global search, command palette…). Deferred a frame so parent folders
+  // that just auto-expanded have rendered.
+  useEffect(() => {
+    if (!active) return;
+    const id = requestAnimationFrame(() =>
+      rowRef.current?.scrollIntoView({ block: 'nearest', inline: 'nearest' }),
+    );
+    return () => cancelAnimationFrame(id);
+  }, [active]);
   const beingDragged = tree.dragging?.kind === 'request' && tree.dragging.id === request.id;
   const examples = request.examples ?? [];
   const hasExamples = examples.length > 0;
@@ -728,18 +813,23 @@ function RequestItem({
   return (
     <div onDragEnd={() => tree.setDragging(null)}>
       <div
+        ref={rowRef}
         draggable
         onDragStart={handleDragStart}
         onDragOver={handleDragOver}
         onDragLeave={() => setDropZone(null)}
         onDrop={handleDrop}
+        aria-current={active ? 'true' : undefined}
         className={cn(
           'group relative flex items-center justify-between rounded px-1.5 py-1 hover:bg-bg-elevated',
-          active && 'bg-bg-elevated',
+          active && 'bg-accent/15 hover:bg-accent/20',
           beingDragged && 'opacity-40',
         )}
         style={{ paddingLeft: `${depth * 12 + 6}px` }}
       >
+        {active && (
+          <span className="pointer-events-none absolute inset-y-1 left-0 w-0.5 rounded-full bg-accent" />
+        )}
         {dropZone === 'above' && (
           <span className="pointer-events-none absolute inset-x-1 -top-px h-0.5 rounded-full bg-accent" />
         )}
@@ -767,26 +857,51 @@ function RequestItem({
           />
         </button>
 
-        <button
-          type="button"
-          onClick={() => selectRequest(request.id)}
-          className="flex flex-1 items-center gap-2 truncate text-left text-13"
-        >
-          {request.body?.type === 'grpc' ? (
-            <span className="font-mono text-[10px] font-semibold text-accent">gRPC</span>
-          ) : (
-            <span className={cn('font-mono text-[10px] font-semibold', methodColorClass(request.method))}>
-              {request.method.slice(0, 4)}
-            </span>
-          )}
-          <span className="truncate text-text">{request.name}</span>
-          {hasExamples && (
-            <span className="ml-1 text-[10px] text-text-muted">{examples.length}</span>
-          )}
-        </button>
+        {renaming ? (
+          <InlineRename
+            initial={request.name}
+            icon={
+              <span className={cn('font-mono text-[10px] font-semibold', methodColorClass(request.method))}>
+                {request.method.slice(0, 4)}
+              </span>
+            }
+            onCancel={() => setRenaming(false)}
+            onCommit={(name) => {
+              setRenaming(false);
+              if (name !== request.name) updateRequest.mutate({ id: request.id, name });
+            }}
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => selectRequest(request.id)}
+            onDoubleClick={() => setRenaming(true)}
+            className="flex flex-1 items-center gap-2 truncate text-left text-13"
+          >
+            {request.body?.type === 'grpc' ? (
+              <span className="font-mono text-[10px] font-semibold text-accent">gRPC</span>
+            ) : (
+              <span className={cn('font-mono text-[10px] font-semibold', methodColorClass(request.method))}>
+                {request.method.slice(0, 4)}
+              </span>
+            )}
+            <span className={cn('truncate text-text', active && 'font-medium')}>{request.name}</span>
+            {hasExamples && (
+              <span className="ml-1 text-[10px] text-text-muted">{examples.length}</span>
+            )}
+            {inWidget && widget?.supported && (
+              <Zap size={10} className="ml-auto shrink-0 fill-accent text-accent" aria-label="In desktop widget" />
+            )}
+          </button>
+        )}
 
         <ItemMenu
           actions={[
+            {
+              label: 'Rename',
+              icon: <Pencil size={13} />,
+              onClick: () => setRenaming(true),
+            },
             {
               label: 'Duplicate',
               icon: <Copy size={13} />,
@@ -802,6 +917,15 @@ function RequestItem({
               icon: <FilePlus2 size={13} />,
               onClick: () => openModal({ kind: 'add-example', requestId: request.id }),
             },
+            ...(widget?.supported
+              ? [
+                  {
+                    label: inWidget ? 'Remove from Widget' : 'Add to Widget',
+                    icon: inWidget ? <ZapOff size={13} /> : <Zap size={13} />,
+                    onClick: () => setWidgetFavorite.mutate({ requestId: request.id, favorite: !inWidget }),
+                  },
+                ]
+              : []),
             {
               label: 'Delete',
               icon: <Trash2 size={13} />,
@@ -909,6 +1033,66 @@ interface MenuAction {
   icon: React.ReactNode;
   onClick: () => void;
   destructive?: boolean;
+}
+
+/**
+ * Inline rename field that replaces a row's label. Enter / blur commits,
+ * Escape cancels. (window.prompt isn't available in Electron renderers.)
+ */
+function InlineRename({
+  initial,
+  icon,
+  onCommit,
+  onCancel,
+}: {
+  initial: string;
+  icon?: React.ReactNode;
+  onCommit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState(initial);
+  const inputRef = useRef<HTMLInputElement>(null);
+  // Guard so blur-after-Enter / blur-after-Escape doesn't commit twice.
+  const doneRef = useRef(false);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, []);
+
+  function finish(commit: boolean) {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    const trimmed = value.trim();
+    if (commit && trimmed) onCommit(trimmed);
+    else onCancel();
+  }
+
+  function onKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      finish(true);
+    } else if (e.key === 'Escape') {
+      e.preventDefault();
+      finish(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-1 items-center gap-1.5 truncate text-13" onClick={(e) => e.stopPropagation()}>
+      {icon}
+      <input
+        ref={inputRef}
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        onKeyDown={onKeyDown}
+        onBlur={() => finish(true)}
+        maxLength={200}
+        className="h-5 min-w-0 flex-1 rounded border border-accent bg-bg px-1 text-13 text-text outline-none"
+        aria-label="Rename"
+      />
+    </div>
+  );
 }
 
 function ItemMenu({ actions }: { actions: MenuAction[] }) {

@@ -34,6 +34,8 @@ interface RequestRow {
   body: Record<string, unknown>;
   auth: Record<string, unknown>;
   description?: string;
+  preRequestScript?: string;
+  postResponseScript?: string;
   sortOrder?: number;
 }
 
@@ -126,14 +128,26 @@ export function exportInsomnia(
       name: r.name,
       description: r.description ?? '',
       method: r.method.toUpperCase(),
-      url: appendQuery(r.url, r.queryParams),
+      // Insomnia appends `parameters[]` to `url` on send (like Volt does), and
+      // that list is the only place a disabled param survives.
+      url: tpl(r.url),
+      parameters: (r.queryParams ?? [])
+        .filter((q) => q.key)
+        .map((q) => ({
+          name: tpl(q.key),
+          value: tpl(q.value),
+          disabled: q.enabled === false ? true : undefined,
+        })),
       headers: (r.headers ?? []).map((h) => ({
-        name: h.key,
-        value: h.value,
+        name: tpl(h.key),
+        value: tpl(h.value),
         disabled: h.enabled === false ? true : undefined,
       })),
       body: buildBody(r),
       authentication: buildAuth(r.auth),
+      // Insomnia 9+ script hooks (`insomnia.*` mirrors `pm.*`, which Volt scripts can use directly).
+      preRequestScript: exportScript(r.preRequestScript),
+      afterResponseScript: exportScript(r.postResponseScript),
       metaSortKey: r.sortOrder ?? 0,
     });
   }
@@ -183,17 +197,15 @@ function collectDescendants(rootId: string, all: CollectionRow[]): Set<string> {
   return out;
 }
 
-function appendQuery(url: string, qp: Array<{ key: string; value: string; enabled?: boolean }>) {
-  const enabled = (qp ?? []).filter((q) => q.enabled !== false && q.key);
-  if (enabled.length === 0) return url;
-  const sep = url.includes('?') ? '&' : '?';
-  return (
-    url +
-    sep +
-    enabled
-      .map((q) => `${encodeURIComponent(q.key)}=${encodeURIComponent(q.value)}`)
-      .join('&')
-  );
+/** Drop the `const insomnia = pm;` alias the importer adds so the script reads natively in Insomnia. */
+function exportScript(s?: string): string {
+  if (!s || !s.trim()) return '';
+  return s.startsWith('const insomnia = pm;\n') ? s.slice('const insomnia = pm;\n'.length) : s;
+}
+
+/** Volt `{{name}}` → Insomnia template `{{ _.name }}` (the import does the reverse). */
+function tpl(s: string): string {
+  return (s ?? '').replace(/\{\{\s*([\w.-]+)\s*\}\}/g, '{{ _.$1 }}');
 }
 
 function buildBody(r: RequestRow): unknown {
@@ -209,30 +221,50 @@ function buildBody(r: RequestRow): unknown {
             : lang === 'html'
               ? 'text/html'
               : 'text/plain';
-      return { mimeType: mime, text: (b.content as string) ?? '' };
+      return { mimeType: mime, text: tpl((b.content as string) ?? '') };
     }
     case 'urlencoded': {
-      const content = (b.content as string | undefined) ?? '';
+      // Volt stores key/value rows; older rows may carry an encoded `content` string.
+      const fields: Array<{ key: string; value: string; enabled?: boolean }> =
+        (b.fields as Array<{ key: string; value: string; enabled?: boolean }> | undefined) ??
+        parseQueryPairs((b.content as string | undefined) ?? '');
       return {
         mimeType: 'application/x-www-form-urlencoded',
-        params: parseQueryPairs(content).map((p) => ({ name: p.key, value: p.value })),
+        params: fields.map((f) => ({
+          name: tpl(f.key),
+          value: tpl(f.value),
+          disabled: f.enabled === false ? true : undefined,
+        })),
       };
     }
     case 'form': {
       const fields =
-        (b.fields as Array<{ key: string; kind: 'text' | 'file'; value: string }> | undefined) ??
+        (b.fields as Array<{ key: string; kind: 'text' | 'file'; value: string; enabled?: boolean }> | undefined) ??
         [];
       return {
         mimeType: 'multipart/form-data',
         params: fields.map((f) =>
           f.kind === 'file'
-            ? { name: f.key, type: 'file' as const, fileName: f.value }
-            : { name: f.key, value: f.value },
+            ? { name: tpl(f.key), type: 'file' as const, fileName: f.value, disabled: f.enabled === false ? true : undefined }
+            : { name: tpl(f.key), value: tpl(f.value), disabled: f.enabled === false ? true : undefined },
         ),
       };
     }
     case 'binary':
       return { mimeType: 'application/octet-stream', fileName: (b.filePath as string) ?? '' };
+    case 'graphql': {
+      // Insomnia stores GraphQL as a JSON envelope under its own mime type.
+      let variables: unknown = {};
+      try {
+        variables = JSON.parse((b.variables as string | undefined) || '{}');
+      } catch {
+        variables = (b.variables as string | undefined) ?? '';
+      }
+      return {
+        mimeType: 'application/graphql',
+        text: JSON.stringify({ query: (b.query as string | undefined) ?? '', variables }),
+      };
+    }
     default:
       return {};
   }
@@ -242,18 +274,18 @@ function buildAuth(auth: Record<string, unknown> | undefined): unknown {
   if (!auth || !auth.type || auth.type === 'none') return {};
   switch (auth.type) {
     case 'bearer':
-      return { type: 'bearer', token: (auth.token as string) ?? '' };
+      return { type: 'bearer', token: tpl((auth.token as string) ?? '') };
     case 'basic':
       return {
         type: 'basic',
-        username: (auth.username as string) ?? '',
-        password: (auth.password as string) ?? '',
+        username: tpl((auth.username as string) ?? ''),
+        password: tpl((auth.password as string) ?? ''),
       };
     case 'apiKey':
       return {
         type: 'apikey',
-        key: (auth.key as string) ?? '',
-        value: (auth.value as string) ?? '',
+        key: tpl((auth.key as string) ?? ''),
+        value: tpl((auth.value as string) ?? ''),
         addTo: (auth.placement as string) === 'query' ? 'queryParams' : 'header',
       };
     default:

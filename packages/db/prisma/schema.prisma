@@ -200,6 +200,7 @@ model ApiRequest {
   // Stored as JSON (Postgres jsonb) since shapes vary per request.
   headers         Json      @default("[]")  // [{ key, value, enabled, description }]
   queryParams     Json      @default("[]")  @map("query_params")
+  pathVariables   Json      @default("[]")  @map("path_variables") // [{ key, value, enabled }] for :name path segments
   bodyType        String    @default("none") @map("body_type") // none|raw|form|urlencoded|binary
   body            Json      @default("{}")  // shape depends on bodyType
   auth            Json      @default("{\"type\":\"none\"}")

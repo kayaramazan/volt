@@ -1,11 +1,30 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Copy, Check, Download, FilePlus2, Loader2, Puzzle } from 'lucide-react';
+import {
+  Copy,
+  Check,
+  CheckCircle2,
+  Download,
+  FilePlus2,
+  Loader2,
+  MinusCircle,
+  Puzzle,
+  XCircle,
+} from 'lucide-react';
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/Tabs';
 import { CodeEditor } from '@/components/request/CodeEditor';
 import { useModals } from '@/stores/modals';
 import { usePlugins } from '@/hooks/useData';
-import { cn, formatBytes, formatDuration, statusColorClass, tryDecodeBase64 } from '@/lib/util';
+import {
+  cn,
+  formatBytes,
+  formatDuration,
+  mimeOf,
+  prettyPrintJson,
+  prettyPrintXml,
+  statusColorClass,
+  tryDecodeBase64,
+} from '@/lib/util';
 import { parseCookies, type ParsedCookie } from '@/lib/cookies';
 import { suggestFilename } from '@/lib/contentDisposition';
 import { voltApi } from '@/lib/volt-api';
@@ -29,9 +48,24 @@ interface SendResponse {
     downloadMs: number | null;
     totalMs: number;
   };
-  preScript?: { logs: string[]; error: string | null };
-  postScript?: { logs: string[]; error: string | null };
+  preScript?: ScriptOutput;
+  postScript?: ScriptOutput;
 }
+
+interface ScriptTest {
+  name: string;
+  passed: boolean;
+  error?: string | null;
+  skipped?: boolean;
+}
+
+interface ScriptOutput {
+  logs: string[];
+  error: string | null;
+  tests?: ScriptTest[];
+}
+
+type BodyView = 'pretty' | 'raw' | 'preview';
 
 interface Props {
   response: SendResponse | null;
@@ -118,6 +152,17 @@ function ResponseTabs({
   requestId: string | null;
 }) {
   const cookies = useMemo(() => parseCookies(response.headers), [response.headers]);
+  // pm.test() results from both script phases, in run order (pre, then post).
+  const tests = useMemo(
+    () => [...(response.preScript?.tests ?? []), ...(response.postScript?.tests ?? [])],
+    [response.preScript, response.postScript],
+  );
+  const testsPassed = tests.filter((t) => t.passed && !t.skipped).length;
+  const testsCounted = tests.filter((t) => !t.skipped).length;
+  const hasScriptOutput =
+    tests.length > 0 ||
+    Boolean(response.preScript?.error || response.postScript?.error) ||
+    (response.preScript?.logs.length ?? 0) + (response.postScript?.logs.length ?? 0) > 0;
   return (
     <Tabs defaultValue="body" className="flex flex-1 flex-col overflow-hidden">
       <TabsList>
@@ -135,6 +180,22 @@ function ResponseTabs({
           )}
         </TabsTrigger>
         <TabsTrigger value="timing">Timing</TabsTrigger>
+        <TabsTrigger value="tests">
+          Tests
+          {testsCounted > 0 && (
+            <span
+              className={cn(
+                'ml-1 text-[10px]',
+                testsPassed === testsCounted ? 'text-success' : 'text-error',
+              )}
+            >
+              {testsPassed}/{testsCounted}
+            </span>
+          )}
+          {testsCounted === 0 && (response.preScript?.error || response.postScript?.error) && (
+            <span className="ml-1 text-[10px] text-error">!</span>
+          )}
+        </TabsTrigger>
       </TabsList>
 
       <TabsContent value="body" className="overflow-hidden">
@@ -149,7 +210,89 @@ function ResponseTabs({
       <TabsContent value="timing" className="overflow-y-auto">
         <TimingTab timing={response.timing} />
       </TabsContent>
+      <TabsContent value="tests" className="overflow-y-auto">
+        <TestsTab
+          tests={tests}
+          passed={testsPassed}
+          counted={testsCounted}
+          pre={response.preScript}
+          post={response.postScript}
+          hasScriptOutput={hasScriptOutput}
+        />
+      </TabsContent>
     </Tabs>
+  );
+}
+
+/**
+ * Postman-style "Test Results": one row per pm.test() with pass / fail /
+ * skipped icon and the assertion message, followed by the script console.
+ */
+function TestsTab({
+  tests,
+  passed,
+  counted,
+  pre,
+  post,
+  hasScriptOutput,
+}: {
+  tests: ScriptTest[];
+  passed: number;
+  counted: number;
+  pre?: ScriptOutput;
+  post?: ScriptOutput;
+  hasScriptOutput: boolean;
+}) {
+  if (!hasScriptOutput) {
+    return (
+      <p className="px-3 py-6 text-center text-xs text-text-muted">
+        No tests ran. Add <code className="font-mono">pm.test(…)</code> calls in the request's Scripts tab.
+      </p>
+    );
+  }
+  const skipped = tests.length - counted;
+  return (
+    <div className="flex flex-col text-xs">
+      {tests.length > 0 && (
+        <>
+          <div className="flex items-center gap-3 border-b border-border bg-bg-elevated px-3 py-1.5 text-[10px] uppercase tracking-wide text-text-muted">
+            <span className={cn('font-semibold', passed === counted ? 'text-success' : 'text-error')}>
+              {passed}/{counted} passed
+            </span>
+            {counted - passed > 0 && <span className="text-error">{counted - passed} failed</span>}
+            {skipped > 0 && <span>{skipped} skipped</span>}
+          </div>
+          <ul>
+            {tests.map((t, i) => {
+              const Icon = t.skipped ? MinusCircle : t.passed ? CheckCircle2 : XCircle;
+              const color = t.skipped ? 'text-text-muted' : t.passed ? 'text-success' : 'text-error';
+              return (
+                <li key={i} className="flex items-start gap-2 border-b border-border/40 px-3 py-1.5">
+                  <Icon size={13} className={cn('mt-0.5 flex-shrink-0', color)} />
+                  <div className="min-w-0 flex-1">
+                    <p className={cn(t.skipped ? 'text-text-muted line-through' : 'text-text')}>{t.name}</p>
+                    {!t.passed && !t.skipped && t.error && (
+                      <p className="mt-0.5 whitespace-pre-wrap break-words font-mono text-[11px] text-error">
+                        {t.error}
+                      </p>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+        </>
+      )}
+      {((pre && (pre.logs.length > 0 || pre.error)) || (post && (post.logs.length > 0 || post.error))) && (
+        <div className="px-3 py-2">
+          <p className="mb-1 text-[10px] uppercase tracking-wide text-text-muted">Console</p>
+          <div className="space-y-1 text-[11px]">
+            {pre && (pre.logs.length > 0 || pre.error) && <ScriptOutputRow label="Pre-request" output={pre} />}
+            {post && (post.logs.length > 0 || post.error) && <ScriptOutputRow label="Post-response" output={post} />}
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -158,8 +301,13 @@ function BodyTab({ response, requestId }: { response: SendResponse; requestId: s
   const { open: openModal } = useModals();
   const { data: pluginsData } = usePlugins();
 
-  const isImage = (response.bodyContentType ?? '').toLowerCase().startsWith('image/');
+  const mime = mimeOf(response.bodyContentType) ?? '';
+  const isSvg = mime === 'image/svg+xml';
+  // SVG is text: show its markup under Pretty/Raw and render it under Preview.
+  const isImage = mime.startsWith('image/') && !isSvg;
   const canSaveBody = Boolean(response.bodyBase64 || response.bodyTempFile);
+  // Pretty / Raw / Preview — sticky across responses like Postman.
+  const [view, setView] = useState<BodyView>('pretty');
 
   // Transformers from loaded plugins that match this response's content-type.
   // An unset matchContentType means "any", so the entry shows up everywhere.
@@ -251,21 +399,26 @@ function BodyTab({ response, requestId }: { response: SendResponse; requestId: s
     return 'text';
   }, [response.bodyContentType]);
 
-  // Pretty-print JSON when applicable
+  // Pretty-print JSON / XML when applicable. JSON goes through a token-level
+  // formatter (not parse/stringify) so 64-bit ids keep their exact digits.
   const formattedText = useMemo(() => {
     if (!text) return '';
-    if (language !== 'json') return text;
-    try {
-      return JSON.stringify(JSON.parse(text), null, 2);
-    } catch {
-      return text;
-    }
+    if (language === 'json') return prettyPrintJson(text) ?? text;
+    if (language === 'xml') return prettyPrintXml(text);
+    return text;
   }, [text, language]);
+
+  const canPreview = language === 'html' || isSvg;
+  const effectiveView: BodyView = view === 'preview' && !canPreview ? 'pretty' : view;
 
   // If a transformer ran successfully, its output replaces the displayed body
   // (and we re-derive the editor language from the transformer's content-type).
   const displayedText =
-    transformResult && transformResult.ok ? transformResult.body : formattedText;
+    transformResult && transformResult.ok
+      ? transformResult.body
+      : effectiveView === 'raw'
+        ? (text ?? '')
+        : formattedText;
   const displayedLanguage: 'json' | 'xml' | 'html' | 'javascript' | 'text' = useMemo(() => {
     if (!transformResult || !transformResult.ok) return language;
     const ct = (transformResult.contentType ?? '').toLowerCase();
@@ -283,7 +436,7 @@ function BodyTab({ response, requestId }: { response: SendResponse; requestId: s
       <div className="flex h-full flex-col">
         <div className="flex flex-1 items-center justify-center overflow-auto p-4">
           <img
-            src={`data:${response.bodyContentType};base64,${response.bodyBase64}`}
+            src={`data:${mime};base64,${response.bodyBase64}`}
             alt="Response"
             className="max-h-full max-w-full object-contain"
           />
@@ -342,76 +495,135 @@ function BodyTab({ response, requestId }: { response: SendResponse; requestId: s
     );
   }
 
+  const showPreview = effectiveView === 'preview' && !(transformResult && transformResult.ok);
+
   return (
-    <div className="relative h-full">
-      <div className="absolute right-3 top-2 z-10 flex items-center gap-1">
-        {transformers.length > 0 && (
-          <div className="flex items-center gap-1 rounded bg-bg-elevated/80 px-1 py-0.5 text-[10px] text-text-muted">
-            <Puzzle size={11} className={transforming ? 'animate-pulse text-accent' : undefined} />
-            <select
-              value={transformerId}
-              onChange={(e) => runTransformer(e.target.value, formattedText)}
-              className="cursor-pointer appearance-none bg-transparent pr-1 text-[10px] text-text-muted outline-none hover:text-text"
-              title="Apply a plugin transformer to this response body"
+    <div className="flex h-full flex-col">
+      <div className="flex items-center justify-between gap-2 border-b border-border px-2 py-1">
+        <div className="flex items-center overflow-hidden rounded border border-border text-[10px]">
+          {(['pretty', 'raw', 'preview'] as BodyView[]).map((v) => {
+            const disabled = v === 'preview' && !canPreview;
+            return (
+              <button
+                key={v}
+                type="button"
+                disabled={disabled}
+                onClick={() => setView(v)}
+                className={cn(
+                  'px-2 py-0.5 capitalize',
+                  effectiveView === v ? 'bg-bg-elevated text-text' : 'text-text-muted hover:text-text',
+                  disabled && 'cursor-not-allowed opacity-40 hover:text-text-muted',
+                )}
+                title={disabled ? 'Preview is available for HTML and SVG responses' : undefined}
+              >
+                {v}
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex items-center gap-1">
+          {transformers.length > 0 && (
+            <div className="flex items-center gap-1 rounded px-1 py-0.5 text-[10px] text-text-muted">
+              <Puzzle size={11} className={transforming ? 'animate-pulse text-accent' : undefined} />
+              <select
+                value={transformerId}
+                onChange={(e) => runTransformer(e.target.value, formattedText)}
+                className="cursor-pointer appearance-none bg-transparent pr-1 text-[10px] text-text-muted outline-none hover:text-text"
+                title="Apply a plugin transformer to this response body"
+              >
+                <option value="">Transform…</option>
+                {transformers.map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          {canSaveBody && (
+            <button
+              type="button"
+              onClick={saveToFile}
+              className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-text-muted hover:text-text"
+              title="Save response body to a file"
             >
-              <option value="">Transform…</option>
-              {transformers.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-        {canSaveBody && (
+              <Download size={11} />
+              Save
+            </button>
+          )}
+          {requestId && (
+            <button
+              type="button"
+              onClick={() => openModal({ kind: 'add-example', requestId })}
+              className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-text-muted hover:text-text"
+              title="Save this request + response as an example"
+            >
+              <FilePlus2 size={11} />
+              Save as example
+            </button>
+          )}
           <button
             type="button"
-            onClick={saveToFile}
-            className="flex items-center gap-1 rounded bg-bg-elevated/80 px-2 py-1 text-[10px] text-text-muted hover:text-text"
-            title="Save response body to a file"
+            onClick={async () => {
+              await navigator.clipboard.writeText(displayedText);
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            }}
+            className="flex items-center gap-1 rounded px-2 py-1 text-[10px] text-text-muted hover:text-text"
+            title="Copy the body as currently displayed"
           >
-            <Download size={11} />
-            Save
+            {copied ? <Check size={11} className="text-success" /> : <Copy size={11} />}
+            {copied ? 'Copied' : 'Copy'}
           </button>
-        )}
-        {requestId && (
-          <button
-            type="button"
-            onClick={() => openModal({ kind: 'add-example', requestId })}
-            className="flex items-center gap-1 rounded bg-bg-elevated/80 px-2 py-1 text-[10px] text-text-muted hover:text-text"
-            title="Save this request + response as an example"
-          >
-            <FilePlus2 size={11} />
-            Save as example
-          </button>
-        )}
-        <button
-          type="button"
-          onClick={async () => {
-            await navigator.clipboard.writeText(displayedText);
-            setCopied(true);
-            setTimeout(() => setCopied(false), 1500);
-          }}
-          className="flex items-center gap-1 rounded bg-bg-elevated/80 px-2 py-1 text-[10px] text-text-muted hover:text-text"
-        >
-          {copied ? <Check size={11} className="text-success" /> : <Copy size={11} />}
-          {copied ? 'Copied' : 'Copy'}
-        </button>
+        </div>
       </div>
       {transformResult && !transformResult.ok && (
-        <div className="absolute inset-x-3 top-10 z-10 rounded border border-error/30 bg-error/10 px-2 py-1 text-[11px] text-error">
+        <div className="mx-2 mt-1 rounded border border-error/30 bg-error/10 px-2 py-1 text-[11px] text-error">
           {transformResult.transformerName}: {transformResult.error}
         </div>
       )}
       {transformResult && transformResult.ok && (
-        <div className="absolute inset-x-3 top-10 z-10 rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[11px] text-accent">
+        <div className="mx-2 mt-1 rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[11px] text-accent">
           Transformed by <span className="font-semibold">{transformResult.transformerName}</span> ·{' '}
           {transformResult.contentType ?? 'no content-type'}
         </div>
       )}
-      <CodeEditor value={displayedText} language={displayedLanguage} readOnly className="h-full" />
+      <div className="min-h-0 flex-1">
+        {showPreview ? (
+          isSvg ? (
+            <div className="flex h-full items-center justify-center overflow-auto bg-white p-4">
+              <img
+                src={`data:image/svg+xml;base64,${response.bodyBase64}`}
+                alt="SVG preview"
+                className="max-h-full max-w-full object-contain"
+              />
+            </div>
+          ) : (
+            // Empty sandbox: no scripts, no same-origin access, no navigation —
+            // the markup is untrusted server output.
+            <iframe
+              title="HTML preview"
+              sandbox=""
+              srcDoc={text ?? ''}
+              className="h-full w-full border-0 bg-white"
+            />
+          )
+        ) : (
+          <CodeEditor
+            value={displayedText}
+            language={effectiveView === 'raw' ? 'text' : displayedLanguage}
+            readOnly
+            className="h-full"
+          />
+        )}
+      </div>
     </div>
   );
+}
+
+/** `content-type` → `Content-Type`, the way browsers' dev tools and Postman show it. */
+function formatHeaderName(name: string): string {
+  return name.replace(/(^|-)([a-z])/g, (_m, sep: string, c: string) => sep + c.toUpperCase());
 }
 
 function SaveBodyButton({ onClick, className }: { onClick: () => void; className?: string }) {
@@ -437,7 +649,7 @@ function HeadersTab({ headers }: { headers: [string, string][] }) {
       <tbody>
         {headers.map(([k, v], i) => (
           <tr key={i} className="border-b border-border/40">
-            <td className="w-1/3 px-3 py-1.5 font-mono text-text-muted">{k}</td>
+            <td className="w-1/3 px-3 py-1.5 font-mono text-text-muted">{formatHeaderName(k)}</td>
             <td className="px-3 py-1.5 font-mono text-text break-all">{v}</td>
           </tr>
         ))}
@@ -540,13 +752,7 @@ function IndeterminateBar() {
   );
 }
 
-function ScriptOutputBanner({
-  pre,
-  post,
-}: {
-  pre?: { logs: string[]; error: string | null };
-  post?: { logs: string[]; error: string | null };
-}) {
+function ScriptOutputBanner({ pre, post }: { pre?: ScriptOutput; post?: ScriptOutput }) {
   const hasPre = pre && (pre.logs.length > 0 || pre.error);
   const hasPost = post && (post.logs.length > 0 || post.error);
   if (!hasPre && !hasPost) return null;
@@ -558,13 +764,7 @@ function ScriptOutputBanner({
   );
 }
 
-function ScriptOutputRow({
-  label,
-  output,
-}: {
-  label: string;
-  output: { logs: string[]; error: string | null };
-}) {
+function ScriptOutputRow({ label, output }: { label: string; output: ScriptOutput }) {
   return (
     <details>
       <summary className="cursor-pointer">

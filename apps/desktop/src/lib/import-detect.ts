@@ -35,17 +35,34 @@ export function detectImportFormat(content: string, filename?: string): Detectio
   if (!parsed || typeof parsed !== 'object') return null;
   const obj = parsed as Record<string, unknown>;
 
-  // Postman v2.1: { info: { schema: '…getpostman.com…' }, item: [...] }
+  // Postman v2.x: { info: { schema: '…postman.com/json/collection/v2.1.0/…' }, item: [...] }
+  if (obj.info && typeof obj.info === 'object') {
+    const schema = (obj.info as { schema?: unknown }).schema;
+    if (typeof schema === 'string' && /postman\.com.*collection/i.test(schema)) {
+      const v = /v(2\.\d)/.exec(schema)?.[1];
+      return {
+        source: 'postman',
+        label: `Postman Collection v${v ?? '2.1'}`,
+        hint: 'Recognized by info.schema.',
+      };
+    }
+    if (schema === undefined && typeof (obj.info as { name?: unknown }).name === 'string' && Array.isArray(obj.item)) {
+      return { source: 'postman', label: 'Postman Collection', hint: 'Recognized by info.name + item[].' };
+    }
+  }
+
+  // Postman environment / globals export: { name, values: [{key, value, enabled}], _postman_variable_scope }
   if (
-    obj.info &&
-    typeof obj.info === 'object' &&
-    typeof (obj.info as { schema?: unknown }).schema === 'string' &&
-    /getpostman\.com/i.test((obj.info as { schema: string }).schema)
+    typeof obj.name === 'string' &&
+    Array.isArray(obj.values) &&
+    (typeof obj._postman_variable_scope === 'string' ||
+      (obj.values as unknown[]).every((v) => v && typeof v === 'object' && 'key' in (v as object)))
   ) {
+    const scope = obj._postman_variable_scope === 'globals' ? 'Globals' : 'Environment';
     return {
       source: 'postman',
-      label: 'Postman Collection v2.1',
-      hint: 'Recognized by info.schema.',
+      label: `Postman ${scope}`,
+      hint: 'Recognized by name + values[].',
     };
   }
 

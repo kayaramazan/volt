@@ -18,6 +18,9 @@ export type HeaderRow = z.infer<typeof HeaderRow>;
 export const QueryParam = HeaderRow; // same shape
 export type QueryParam = z.infer<typeof QueryParam>;
 
+export const PathVariable = HeaderRow; // same shape: { id, key, value, enabled, description? }
+export type PathVariable = z.infer<typeof PathVariable>;
+
 // Body — discriminated union by type
 export const RawBody = z.object({
   type: z.literal('raw'),
@@ -169,6 +172,10 @@ export const ApiRequest = z.object({
   url: z.string().max(8_000), // before variable resolution; can contain {{vars}}
   headers: z.array(HeaderRow).default([]),
   queryParams: z.array(QueryParam).default([]),
+  // Postman-style path variables: `/users/:id` + { key: 'id', value: '42' }.
+  // Resolved in the renderer at send time; imported from Postman url.variable[]
+  // and OpenAPI path parameters.
+  pathVariables: z.array(PathVariable).default([]),
   body: RequestBody.default({ type: 'none' }),
   auth: RequestAuth.default({ type: 'none' }),
   // JavaScript run in a sandboxed vm before/after sending. Empty = no-op.
@@ -224,6 +231,11 @@ export const SendRequestInput = z.object({
   // The request id is included so the renderer can show "in-flight" state
   // and the main process can cancel by id.
   inFlightId: z.string(),
+  // The saved request this send came from (null for ad-hoc sends), so the
+  // history row can link back to it.
+  requestId: uuid.nullable().optional(),
+  // Display name of the request, surfaced to scripts as pm.info.requestName.
+  requestName: z.string().optional(),
   request: ResolvedRequest,
   // Optional pre/post-request scripts. Run in a sandboxed vm in the main
   // process around the HTTP dispatch.
@@ -249,9 +261,20 @@ export const ResponseTiming = z.object({
 });
 export type ResponseTiming = z.infer<typeof ResponseTiming>;
 
+export const ScriptTestResult = z.object({
+  name: z.string(),
+  passed: z.boolean(),
+  // Assertion / exception message for failed tests.
+  error: z.string().nullable().optional(),
+  skipped: z.boolean().optional(),
+});
+export type ScriptTestResult = z.infer<typeof ScriptTestResult>;
+
 export const ScriptOutput = z.object({
   logs: z.array(z.string()),
   error: z.string().nullable(),
+  // pm.test() results in declaration order.
+  tests: z.array(ScriptTestResult).optional(),
 });
 
 export const SuccessResponse = z.object({

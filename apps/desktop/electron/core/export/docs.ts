@@ -257,8 +257,22 @@ function bodyBlock(req: RequestRow): string[] {
       const fence = '```' + lang;
       return [fence, (b.content as string) ?? '', '```'];
     }
-    case 'urlencoded':
-      return ['```', (b.content as string) ?? '', '```'];
+    case 'urlencoded': {
+      const fields = b.fields as Array<{ key: string; value: string; enabled?: boolean }> | undefined;
+      if (!fields) return ['```', (b.content as string) ?? '', '```'];
+      const out: string[] = ['| Field | Value |', '| --- | --- |'];
+      for (const f of fields) {
+        if (f.enabled === false) continue;
+        out.push(`| ${escapeCell(f.key)} | ${escapeCell(f.value)} |`);
+      }
+      return out;
+    }
+    case 'graphql': {
+      const out = ['```graphql', (b.query as string) ?? '', '```'];
+      const vars = (b.variables as string | undefined)?.trim();
+      if (vars) out.push('', '**Variables**', '', '```json', vars, '```');
+      return out;
+    }
     case 'form': {
       const fields =
         (b.fields as Array<{ key: string; kind: 'text' | 'file'; value: string }> | undefined) ??

@@ -20,12 +20,18 @@ import {
 import {
   applyPulledChange,
   clearDirtyFlags,
+  createWorkspace,
+  deleteWorkspaceLocal,
+  getState,
   listDirtyRows,
   listWorkspaces,
   recordConflict,
+  setState as setAppState,
   setWorkspaceRemoteRevision,
+  updateWorkspaceFromRemote,
 } from '../db/queries';
-import { authedFetch, currentSessionToken, getApiBase } from '../auth/manager';
+import { authedFetch, currentSessionToken, currentUser, getApiBase } from '../auth/manager';
+import { scheduleSnapshot } from '../widget/bridge';
 
 type SyncState = 'offline' | 'syncing' | 'synced' | 'conflict' | 'error';
 
@@ -52,6 +58,162 @@ export function startSync() {
   schedulePush();
   schedulePull();
   openStreams();
+  // Pick up team workspaces this user can see but doesn't have locally yet
+  // (joined a team, teammate created a workspace, …).
+  void refreshRemoteWorkspaces().catch((err) => {
+    if (!isBackendUnreachable(err)) console.warn('[sync] workspace refresh failed:', (err as Error).message);
+  });
+}
+
+// ─────────────────────────────────────────────────────────
+// Per-workspace serialization
+//
+// Push and pull for the same workspace must never interleave: a pull that
+// lands between a push request and its response would advance
+// remoteRevision past rows we haven't seen, and two pulls racing would apply
+// changes twice. Every network operation for a workspace runs through this
+// queue. (The old `currentState === 'syncing'` guard was both racy and could
+// get stuck, silently disabling all future pushes.)
+// ─────────────────────────────────────────────────────────
+
+const wsQueues = new Map<string, Promise<unknown>>();
+let inFlightOps = 0;
+
+function withWorkspaceLock<T>(workspaceId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = wsQueues.get(workspaceId) ?? Promise.resolve();
+  const run = prev.catch(() => undefined).then(async () => {
+    inFlightOps += 1;
+    setState('syncing');
+    try {
+      return await fn();
+    } finally {
+      inFlightOps -= 1;
+      // Last operation done: publish the outcome it asked for (or 'synced').
+      if (inFlightOps === 0) {
+        const next = pendingTerminal ?? 'synced';
+        pendingTerminal = null;
+        if (currentState === 'syncing') setState(next);
+      }
+    }
+  });
+  wsQueues.set(workspaceId, run.catch(() => undefined));
+  return run;
+}
+
+/**
+ * Settle the visible state. While operations are still running, remember
+ * the outcome and apply it when the last one finishes (errors/offline win
+ * over 'synced' so a failure isn't hidden by a later success).
+ */
+let pendingTerminal: SyncState | null = null;
+function settleState(next: SyncState) {
+  if (inFlightOps > 0) {
+    if (pendingTerminal === null || pendingTerminal === 'synced') pendingTerminal = next;
+    return;
+  }
+  setState(next);
+}
+
+// ─────────────────────────────────────────────────────────
+// Remote workspace discovery
+// ─────────────────────────────────────────────────────────
+
+interface RemoteWorkspace {
+  id: string;
+  name: string;
+  ownerUserId: string | null;
+  ownerTeamId: string | null;
+}
+
+const KNOWN_REMOTE_KEY = 'sync.known_remote_workspaces.';
+
+/**
+ * Mirror the server's workspace list locally:
+ *   - workspaces the user gained access to (joined a team, a teammate created
+ *     one) are created locally and pulled right away, with a live SSE stream;
+ *   - renames made elsewhere are applied;
+ *   - workspaces that disappeared from the server for THIS user (deleted, or
+ *     the user was removed from the team) are removed locally. If they still
+ *     hold unpushed local edits they are kept as local-only instead, so no
+ *     work is lost.
+ * "Disappeared" is judged against the list this same user saw last time, so
+ * switching accounts never deletes another account's workspaces.
+ */
+export async function refreshRemoteWorkspaces(): Promise<{ added: string[]; removed: string[]; renamed: string[] }> {
+  const out = { added: [] as string[], removed: [] as string[], renamed: [] as string[] };
+  const user = currentUser();
+  if (!currentSessionToken() || !user) return out;
+  const res = await authedFetch('/api/workspaces');
+  if (res.status === 401) {
+    stopSync();
+    return out;
+  }
+  if (!res.ok) throw new Error(`Workspace list failed: ${res.status}`);
+  recordReachable();
+  const body = (await res.json()) as { personal: RemoteWorkspace[]; team: RemoteWorkspace[] };
+  const remote = [...(body.personal ?? []), ...(body.team ?? [])];
+  const remoteIds = new Set(remote.map((w) => w.id));
+  const local = new Map(listWorkspaces().map((w) => [w.id, w]));
+
+  for (const rw of remote) {
+    const lw = local.get(rw.id);
+    if (!lw) {
+      createWorkspace({
+        id: rw.id,
+        name: rw.name,
+        localOnly: false,
+        ownerUserId: rw.ownerUserId,
+        ownerTeamId: rw.ownerTeamId,
+      });
+      out.added.push(rw.id);
+    } else if (lw.name !== rw.name || lw.localOnly || (lw.ownerTeamId ?? null) !== (rw.ownerTeamId ?? null)) {
+      updateWorkspaceFromRemote(rw.id, {
+        name: rw.name,
+        ownerTeamId: rw.ownerTeamId,
+        ownerUserId: rw.ownerUserId,
+      });
+      out.renamed.push(rw.id);
+    }
+  }
+
+  const knownKey = KNOWN_REMOTE_KEY + user.id;
+  let previouslyKnown: string[] = [];
+  try {
+    previouslyKnown = JSON.parse(getState(knownKey) ?? '[]') as string[];
+  } catch {
+    previouslyKnown = [];
+  }
+  for (const id of previouslyKnown) {
+    if (remoteIds.has(id)) continue;
+    const lw = local.get(id);
+    if (!lw || lw.localOnly) continue;
+    const d = listDirtyRows(id);
+    const hasUnpushed = d.collections.length + d.requests.length + d.environments.length > 0;
+    sseControllers.get(id)?.abort();
+    sseControllers.delete(id);
+    if (hasUnpushed) {
+      // Keep the user's unsynced work; it just stops syncing.
+      updateWorkspaceFromRemote(id, { localOnly: true, name: `${lw.name} (offline copy)` });
+      console.log(`[sync] lost access to workspace ${id}; kept as a local-only copy (unsynced edits)`);
+    } else {
+      deleteWorkspaceLocal(id);
+      console.log(`[sync] lost access to workspace ${id}; removed locally`);
+    }
+    out.removed.push(id);
+  }
+  setAppState(knownKey, JSON.stringify([...remoteIds]));
+
+  if (out.added.length || out.removed.length || out.renamed.length) {
+    broadcast({ type: 'data:changed', table: 'workspace' });
+  }
+  // New workspaces: live stream + initial pull.
+  openStreams();
+  await Promise.all(
+    out.added.map((id) =>
+      pullWorkspace(id).catch((err) => console.warn(`[sync] initial pull failed for ${id}:`, (err as Error).message)),
+    ),
+  );
+  return out;
 }
 
 export function stopSync() {
@@ -119,10 +281,16 @@ function recordReachable() {
  */
 export function notifyDirty() {
   if (!currentSessionToken()) return;
-  // The schedulePush interval already runs; this is a hint that work exists.
-  // A more aggressive implementation would reset the timer to push now.
-  // For MVP, the 5s interval is fine.
+  // Coalesce bursts of edits (typing, multi-row saves) into one push shortly
+  // after the last change. runPushOnce() is re-entrancy safe, and the regular
+  // interval still runs as a fallback.
+  if (dirtyPushTimer) clearTimeout(dirtyPushTimer);
+  dirtyPushTimer = setTimeout(() => {
+    dirtyPushTimer = null;
+    void runPushOnce();
+  }, 750);
 }
+let dirtyPushTimer: NodeJS.Timeout | null = null;
 
 // ─────────────────────────────────────────────────────────
 // Push loop
@@ -135,7 +303,6 @@ function schedulePush() {
 }
 
 async function runPushOnce() {
-  if (currentState === 'syncing') return; // already in progress
   if (breakerTripped) return; // backend was unreachable, stand down
   const all = listWorkspaces();
   const workspacesToSync = all.filter((w) => !w.localOnly && w.dirty);
@@ -166,14 +333,14 @@ async function runPushOnce() {
       const msg = err instanceof Error ? err.message : String(err);
       if (isBackendUnreachable(err)) {
         console.log(`[sync] push skipped (backend unreachable) for ${ws.id}`);
-        setState('offline');
+        settleState('offline');
         recordUnreachable();
         // Once the breaker trips, no point trying other workspaces — same outcome.
         if (breakerTripped) return;
       } else {
         console.error(`[sync] push FAILED for ${ws.id}:`, msg);
         lastError = msg;
-        setState('error');
+        settleState('error');
       }
     }
   }
@@ -181,8 +348,16 @@ async function runPushOnce() {
 
 let lastIdleLogAt: number | null = null;
 
-async function pushWorkspace(workspaceId: string, baseRevision: string): Promise<void> {
-  setState('syncing');
+function pushWorkspace(workspaceId: string, _baseRevision?: string): Promise<void> {
+  return withWorkspaceLock(workspaceId, () => pushWorkspaceLocked(workspaceId));
+}
+
+async function pushWorkspaceLocked(workspaceId: string, attempt = 0): Promise<void> {
+  // Always read the CURRENT base revision under the lock; a pull that ran
+  // just before us may have advanced it.
+  const wsRow = listWorkspaces().find((w) => w.id === workspaceId);
+  if (!wsRow || wsRow.localOnly) return;
+  const baseRevision = wsRow.remoteRevision;
   const dirty = listDirtyRows(workspaceId);
   const changes: SyncChange[] = [
     ...dirty.collections.map<SyncChange>((c) =>
@@ -217,6 +392,7 @@ async function pushWorkspace(workspaceId: string, baseRevision: string): Promise
               url: r.url,
               headers: JSON.parse(r.headers),
               queryParams: JSON.parse(r.queryParams),
+              pathVariables: safeParse(r.pathVariables, []),
               bodyType: r.bodyType,
               body: JSON.parse(r.body),
               auth: JSON.parse(r.auth),
@@ -243,35 +419,12 @@ async function pushWorkspace(workspaceId: string, baseRevision: string): Promise
             },
           },
     ),
-    // History rows: metadata only (no response body bytes leave the device).
-    ...dirty.history.map<SyncChange>((h) =>
-      h.deletedAt
-        ? { op: 'delete', table: 'history', rowId: h.id }
-        : {
-            op: 'upsert',
-            table: 'history',
-            rowId: h.id,
-            data: {
-              id: h.id,
-              requestId: h.requestId,
-              method: h.method,
-              url: h.url,
-              requestSnapshot: safeParse(h.requestSnapshot, {}),
-              statusCode: h.statusCode,
-              responseHeaders: h.responseHeaders ? safeParse(h.responseHeaders, null) : null,
-              responseSizeBytes: h.responseSizeBytes,
-              responseContentType: h.responseContentType,
-              startedAt: h.startedAt,
-              durationMs: h.durationMs,
-              errorCode: h.errorCode,
-              pinned: h.pinned,
-            },
-          },
-    ),
+    // History never leaves the device: snapshots carry resolved auth headers
+    // and tokens, and teammates must not see each other's traffic.
   ];
 
   if (changes.length === 0) {
-    setState('synced');
+    settleState('synced');
     return;
   }
 
@@ -281,11 +434,13 @@ async function pushWorkspace(workspaceId: string, baseRevision: string): Promise
   });
 
   if (res.status === 409) {
-    // Stale baseRevision — pull first, then will retry on next push tick.
-    const body = (await res.json()) as { currentRevision: string };
-    setWorkspaceRemoteRevision(workspaceId, body.currentRevision);
-    await pullWorkspace(workspaceId);
-    return; // next interval will re-push remaining dirty
+    // Stale baseRevision: someone pushed first. Pull what we missed (from OUR
+    // revision, never jump ahead or we'd skip their rows), then retry the
+    // push right away with the rows that are still dirty.
+    await res.json().catch(() => null);
+    await pullWorkspaceLocked(workspaceId);
+    if (attempt < 3) return pushWorkspaceLocked(workspaceId, attempt + 1);
+    return; // still racing a busy teammate; the next tick will retry
   }
 
   if (!res.ok) {
@@ -296,7 +451,7 @@ async function pushWorkspace(workspaceId: string, baseRevision: string): Promise
   clearDirtyFlags(workspaceId, result.applied);
   setWorkspaceRemoteRevision(workspaceId, result.newRevision);
   lastSyncedAt = Date.now();
-  setState('synced');
+  settleState('synced');
   emitDataChanged(workspaceId);
 }
 
@@ -311,8 +466,19 @@ function schedulePull() {
 }
 
 async function runPullOnce() {
-  if (currentState === 'syncing') return;
   if (breakerTripped) return; // backend was unreachable, stand down
+  // Also catches workspaces created/shared/renamed/removed elsewhere.
+  try {
+    await refreshRemoteWorkspaces();
+  } catch (err) {
+    if (isBackendUnreachable(err)) {
+      recordUnreachable();
+      if (breakerTripped) return;
+    } else {
+      console.warn('[sync] workspace refresh failed:', (err as Error).message);
+    }
+  }
+  openStreams();
   const wss = listWorkspaces().filter((w) => !w.localOnly);
   for (const ws of wss) {
     try {
@@ -332,9 +498,13 @@ async function runPullOnce() {
   }
 }
 
-async function pullWorkspace(workspaceId: string): Promise<void> {
+function pullWorkspace(workspaceId: string): Promise<void> {
+  return withWorkspaceLock(workspaceId, () => pullWorkspaceLocked(workspaceId));
+}
+
+async function pullWorkspaceLocked(workspaceId: string): Promise<void> {
   const ws = listWorkspaces().find((w) => w.id === workspaceId);
-  if (!ws) return;
+  if (!ws || ws.localOnly) return;
   const since = ws.remoteRevision;
 
   const res = await authedFetch(`/api/sync/pull?workspaceId=${workspaceId}&since=${since}`);
@@ -348,12 +518,15 @@ async function pullWorkspace(workspaceId: string): Promise<void> {
   }
   const data = (await res.json()) as SyncPullOutput;
   if (data.changes.length === 0 && data.currentRevision === since) {
+    settleState(currentState === 'conflict' ? 'conflict' : 'synced');
     return; // nothing new
   }
 
   const conflicts: Array<{ table: string; rowId: string; previousState: object }> = [];
 
   for (const change of data.changes) {
+    // History is device-private; ignore any that an older client uploaded.
+    if (change.table === 'history') continue;
     const result = applyPulledChange(workspaceId, change);
     if (result.conflict) {
       conflicts.push({
@@ -385,7 +558,7 @@ async function pullWorkspace(workspaceId: string): Promise<void> {
     setState('conflict');
   } else {
     lastSyncedAt = Date.now();
-    setState('synced');
+    settleState('synced');
   }
 
   emitDataChanged(workspaceId);
@@ -572,6 +745,8 @@ function emitConflict(workspaceId: string, table: string, rowId: string) {
 }
 
 function broadcast(event: object) {
+  // Teammates' renames/deletes reach the desktop widget too.
+  if ((event as { type?: string }).type === 'data:changed') scheduleSnapshot();
   for (const win of BrowserWindow.getAllWindows()) {
     win.webContents.send('volt:event', event);
   }

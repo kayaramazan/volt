@@ -28,10 +28,13 @@ export function GlobalsModal() {
     const key = newKey.trim();
     if (!key) return;
     // Try JSON-parse first so users can enter numbers, booleans, objects. Falls
-    // back to plain string. (Scripts can `.get` and use any of those.)
+    // back to plain string. (Scripts can `.get` and use any of those.) Only
+    // accept the parse when it round-trips exactly, so `1e5`, `007`, huge ids
+    // and `null` keep their literal text for {{name}} substitution.
     let value: unknown = newValue;
     try {
-      value = JSON.parse(newValue);
+      const parsed: unknown = JSON.parse(newValue);
+      if (parsed !== null && JSON.stringify(parsed) === newValue.trim()) value = parsed;
     } catch {
       /* leave as string */
     }

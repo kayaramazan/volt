@@ -14,10 +14,12 @@ interface HistoryEntry {
   method: string;
   url: string;
   statusCode: number | null;
-  startedAt: number;
+  startedAt: string | number;
   durationMs: number;
-  responseBody: { type: 'Buffer'; data: number[] } | string | null;
-  responseHeaders: string | null;
+  /** history:get ships the body base64-encoded (see HistoryGetContract). */
+  responseBodyBase64: string | null;
+  responseBodyTempFile: string | null;
+  responseHeaders: Array<[string, string]> | null;
   responseContentType: string | null;
 }
 
@@ -142,24 +144,20 @@ function kindColor(k: 'added' | 'removed' | 'changed') {
 }
 
 function bodyAsJson(entry: HistoryEntry): { ok: true; value: unknown } | { ok: false } {
-  // history:get returns the body as a Node Buffer-like {type:'Buffer',data:[...]}.
+  // history:get returns the body base64-encoded. Decode to bytes and then
+  // UTF-8 (atob alone would mangle non-ASCII strings in the JSON).
+  const b64 = entry.responseBodyBase64;
+  if (!b64) return { ok: false };
   let text: string | null = null;
-  const b = entry.responseBody as unknown;
-  if (typeof b === 'string') {
-    text = b;
-  } else if (b && typeof b === 'object' && 'data' in (b as Record<string, unknown>)) {
-    const data = (b as { data: number[] }).data;
-    try {
-      text = new TextDecoder().decode(new Uint8Array(data));
-    } catch {
-      text = null;
-    }
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    text = new TextDecoder('utf-8').decode(bytes);
+  } catch {
+    text = tryDecodeBase64(b64, entry.responseContentType).text;
   }
-  if (!text) {
-    // base64-decoded form (older shape)
-    if (typeof b === 'string') text = tryDecodeBase64(b, entry.responseContentType).text;
-  }
-  if (!text) return { ok: false };
+  if (!text || !text.trim()) return { ok: false };
   try {
     return { ok: true, value: JSON.parse(text) };
   } catch {

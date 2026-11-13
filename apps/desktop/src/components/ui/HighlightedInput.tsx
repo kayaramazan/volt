@@ -13,6 +13,7 @@ import { createPortal } from 'react-dom';
 
 import { cn } from '@/lib/util';
 import { splitByVars, VAR_REGEX } from '@/lib/var-highlight';
+import { useIsVarResolved } from '@/lib/variables-context';
 import { VarEditor } from './VarEditor';
 
 type Props = Omit<InputHTMLAttributes<HTMLInputElement>, 'value'> & {
@@ -20,6 +21,12 @@ type Props = Omit<InputHTMLAttributes<HTMLInputElement>, 'value'> & {
   invalid?: boolean;
   /** Borderless transparent variant — fits inside a KeyValueEditor row. */
   flat?: boolean;
+  /**
+   * Show the hover VarEditor popup on `{{var}}` tokens (default true). Turn
+   * off inside the environment editor itself, where a "save to Globals"
+   * popup over a value you're already editing makes no sense.
+   */
+  varPopup?: boolean;
 };
 
 // Force-identical text metrics on both the visible overlay and the transparent
@@ -49,7 +56,7 @@ interface VarPopup {
 }
 
 export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function HighlightedInput(
-  { value, onChange, onScroll, className, invalid, flat, disabled, ...rest },
+  { value, onChange, onScroll, className, invalid, flat, disabled, varPopup = true, ...rest },
   ref,
 ) {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -98,7 +105,7 @@ export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function Hig
   const handleMouseMove = useCallback(
     (e: ReactMouseEvent<HTMLDivElement>) => {
       const overlay = overlayRef.current;
-      if (!overlay) return;
+      if (!overlay || !varPopup) return;
       const spans = overlay.querySelectorAll<HTMLElement>('[data-var-span="1"]');
       for (const span of spans) {
         const rect = span.getBoundingClientRect();
@@ -122,7 +129,7 @@ export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function Hig
       // travel to the popup itself without it disappearing).
       if (popup) scheduleClose();
     },
-    [popup, cancelClose, scheduleClose],
+    [popup, cancelClose, scheduleClose, varPopup],
   );
 
   const parts = splitByVars(value);
@@ -226,11 +233,15 @@ export const HighlightedInput = forwardRef<HTMLInputElement, Props>(function Hig
 function VarSpan({ text }: { text: string }) {
   const m = new RegExp(VAR_REGEX.source).exec(text);
   const name = m?.[1] ?? '';
+  const resolved = useIsVarResolved(name);
   return (
     <span
       data-var-span="1"
       data-var-name={name}
-      className="rounded-sm bg-accent/15 text-accent"
+      className={cn(
+        'rounded-sm',
+        resolved ? 'bg-accent/15 text-accent' : 'bg-error/15 text-error underline decoration-dotted',
+      )}
     >
       {text}
     </span>

@@ -73,6 +73,25 @@ export function renameWorkspace(id: string, name: string) {
   return getWorkspace(id);
 }
 
+/**
+ * Apply workspace metadata that changed on the server (rename by a teammate,
+ * moved to a team, access lost). Does NOT mark the row dirty — this is the
+ * server's state, not a local edit.
+ */
+export function updateWorkspaceFromRemote(
+  id: string,
+  patch: { name?: string; ownerTeamId?: string | null; ownerUserId?: string | null; localOnly?: boolean },
+) {
+  const set: Record<string, unknown> = { updatedAt: now() };
+  if (patch.name !== undefined) set.name = patch.name;
+  if (patch.ownerTeamId !== undefined) set.ownerTeamId = patch.ownerTeamId;
+  if (patch.ownerUserId !== undefined) set.ownerUserId = patch.ownerUserId;
+  if (patch.localOnly !== undefined) set.localOnly = patch.localOnly;
+  else set.localOnly = false;
+  getDb().update(workspaces).set(set).where(eq(workspaces.id, id)).run();
+  return getWorkspace(id);
+}
+
 export function deleteWorkspaceLocal(id: string) {
   // Hard delete locally — cascade clears child rows.
   // For cloud workspaces, the sync engine will issue a server-side soft delete
@@ -106,6 +125,19 @@ export function createCollection(input: {
 }) {
   const id = uuid();
   const ts = now();
+  // Append after the current siblings (Postman behaviour). sortOrder 0 would
+  // jump a new folder to the top of a reordered list.
+  const maxSibling = getDb()
+    .select({ m: sql<number | null>`max(${collections.sortOrder})` })
+    .from(collections)
+    .where(
+      and(
+        eq(collections.workspaceId, input.workspaceId),
+        input.parentId === null ? isNull(collections.parentId) : eq(collections.parentId, input.parentId),
+        isNull(collections.deletedAt),
+      ),
+    )
+    .get();
   getDb()
     .insert(collections)
     .values({
@@ -114,7 +146,7 @@ export function createCollection(input: {
       parentId: input.parentId,
       name: input.name,
       description: input.description ?? '',
-      sortOrder: 0,
+      sortOrder: (maxSibling?.m ?? -1) + 1,
       variables: '[]',
       dirty: true,
       remoteRevision: '0',
@@ -177,12 +209,50 @@ export function updateCollection(
 export function softDeleteCollection(id: string) {
   const existing = getDb().select().from(collections).where(eq(collections.id, id)).get();
   if (!existing) return;
-  getDb()
-    .update(collections)
-    .set({ deletedAt: now(), dirty: true, updatedAt: now() })
-    .where(eq(collections.id, id))
-    .run();
+  // Cascade to every descendant folder and the requests inside them.
+  // Without this the children stay "alive" (listed by apiRequest:list,
+  // searchable, syncable) while being unreachable from the tree.
+  const ids = collectDescendantCollectionIds(existing.workspaceId, id);
+  const ts = now();
+  getDb().transaction((tx) => {
+    for (const cid of ids) {
+      tx.update(collections)
+        .set({ deletedAt: ts, dirty: true, updatedAt: ts })
+        .where(and(eq(collections.id, cid), isNull(collections.deletedAt)))
+        .run();
+      tx.update(apiRequests)
+        .set({ deletedAt: ts, dirty: true, updatedAt: ts })
+        .where(and(eq(apiRequests.collectionId, cid), isNull(apiRequests.deletedAt)))
+        .run();
+    }
+  });
   markWorkspaceDirty(existing.workspaceId);
+}
+
+/** `rootId` plus every live collection nested under it, depth-first. */
+function collectDescendantCollectionIds(workspaceId: string, rootId: string): string[] {
+  const all = getDb()
+    .select({ id: collections.id, parentId: collections.parentId })
+    .from(collections)
+    .where(and(eq(collections.workspaceId, workspaceId), isNull(collections.deletedAt)))
+    .all();
+  const byParent = new Map<string | null, string[]>();
+  for (const c of all) {
+    const key = c.parentId ?? null;
+    if (!byParent.has(key)) byParent.set(key, []);
+    byParent.get(key)!.push(c.id);
+  }
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const stack = [rootId];
+  while (stack.length) {
+    const cur = stack.pop()!;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    out.push(cur);
+    for (const child of byParent.get(cur) ?? []) stack.push(child);
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -197,6 +267,7 @@ export function createRequest(input: {
   url: string;
   headers?: unknown;
   queryParams?: unknown;
+  pathVariables?: unknown;
   bodyType?: string;
   body?: unknown;
   auth?: unknown;
@@ -210,6 +281,25 @@ export function createRequest(input: {
 }) {
   const id = input.id ?? uuid();
   const ts = now();
+  // Default to "append after siblings" so a new request lands at the bottom
+  // of its folder instead of jumping to the top of a reordered list.
+  let sortOrder = input.sortOrder;
+  if (sortOrder === undefined) {
+    const maxSibling = getDb()
+      .select({ m: sql<number | null>`max(${apiRequests.sortOrder})` })
+      .from(apiRequests)
+      .where(
+        and(
+          eq(apiRequests.workspaceId, input.workspaceId),
+          input.collectionId === null
+            ? isNull(apiRequests.collectionId)
+            : eq(apiRequests.collectionId, input.collectionId),
+          isNull(apiRequests.deletedAt),
+        ),
+      )
+      .get();
+    sortOrder = (maxSibling?.m ?? -1) + 1;
+  }
   getDb()
     .insert(apiRequests)
     .values({
@@ -221,6 +311,7 @@ export function createRequest(input: {
       url: input.url,
       headers: JSON.stringify(input.headers ?? []),
       queryParams: JSON.stringify(input.queryParams ?? []),
+      pathVariables: JSON.stringify(input.pathVariables ?? []),
       bodyType: input.bodyType ?? 'none',
       body: JSON.stringify(input.body ?? { type: 'none' }),
       auth: JSON.stringify(input.auth ?? { type: 'none' }),
@@ -228,7 +319,7 @@ export function createRequest(input: {
       postResponseScript: input.postResponseScript ?? '',
       description: input.description ?? '',
       examples: JSON.stringify(input.examples ?? []),
-      sortOrder: input.sortOrder ?? 0,
+      sortOrder,
       dirty: true,
       remoteRevision: '0',
       deletedAt: null,
@@ -272,6 +363,7 @@ export function updateRequest(
     url: string;
     headers: unknown;
     queryParams: unknown;
+    pathVariables: unknown;
     bodyType: string;
     body: unknown;
     auth: unknown;
@@ -295,6 +387,10 @@ export function updateRequest(
       headers: patch.headers !== undefined ? JSON.stringify(patch.headers) : existing.headers,
       queryParams:
         patch.queryParams !== undefined ? JSON.stringify(patch.queryParams) : existing.queryParams,
+      pathVariables:
+        patch.pathVariables !== undefined
+          ? JSON.stringify(patch.pathVariables)
+          : existing.pathVariables,
       bodyType: patch.bodyType ?? existing.bodyType,
       body: patch.body !== undefined ? JSON.stringify(patch.body) : existing.body,
       auth: patch.auth !== undefined ? JSON.stringify(patch.auth) : existing.auth,
@@ -321,6 +417,91 @@ export function softDeleteRequest(id: string) {
     .where(eq(apiRequests.id, id))
     .run();
   markWorkspaceDirty(existing.workspaceId);
+}
+
+/**
+ * Deep-copy a collection: the folder itself, every nested sub-folder and
+ * every request (with examples/scripts/docs). The copy is placed right after
+ * the source among its siblings and named "<name> (copy)". Returns the new
+ * root collection, or null if the source doesn't exist.
+ */
+export function duplicateCollection(sourceId: string) {
+  const db = getDb();
+  const source = db.select().from(collections).where(eq(collections.id, sourceId)).get();
+  if (!source || source.deletedAt) return null;
+  const ts = now();
+  const newRootId = uuid();
+
+  db.transaction((tx) => {
+    // Make room right after the source so the copy sits next to it.
+    tx.update(collections)
+      .set({ sortOrder: sql`${collections.sortOrder} + 1`, dirty: true, updatedAt: ts })
+      .where(
+        and(
+          eq(collections.workspaceId, source.workspaceId),
+          source.parentId === null
+            ? isNull(collections.parentId)
+            : eq(collections.parentId, source.parentId),
+          isNull(collections.deletedAt),
+          gt(collections.sortOrder, source.sortOrder),
+        ),
+      )
+      .run();
+
+    const copyTree = (fromId: string, toId: string, toParentId: string | null, nameSuffix: string) => {
+      const row = tx.select().from(collections).where(eq(collections.id, fromId)).get();
+      if (!row) return;
+      tx.insert(collections)
+        .values({
+          id: toId,
+          workspaceId: row.workspaceId,
+          parentId: toParentId,
+          name: `${row.name}${nameSuffix}`,
+          description: row.description,
+          sortOrder: fromId === sourceId ? row.sortOrder + 1 : row.sortOrder,
+          variables: row.variables,
+          mocks: row.mocks,
+          dirty: true,
+          remoteRevision: '0',
+          deletedAt: null,
+          createdAt: ts,
+          updatedAt: ts,
+        })
+        .run();
+
+      const reqs = tx
+        .select()
+        .from(apiRequests)
+        .where(and(eq(apiRequests.collectionId, fromId), isNull(apiRequests.deletedAt)))
+        .all();
+      for (const r of reqs) {
+        tx.insert(apiRequests)
+          .values({
+            ...r,
+            id: uuid(),
+            collectionId: toId,
+            dirty: true,
+            remoteRevision: '0',
+            deletedAt: null,
+            createdAt: ts,
+            updatedAt: ts,
+          })
+          .run();
+      }
+
+      const children = tx
+        .select({ id: collections.id })
+        .from(collections)
+        .where(and(eq(collections.parentId, fromId), isNull(collections.deletedAt)))
+        .all();
+      for (const child of children) copyTree(child.id, uuid(), toId, '');
+    };
+
+    copyTree(sourceId, newRootId, source.parentId, ' (copy)');
+  });
+
+  markWorkspaceDirty(source.workspaceId);
+  return getCollection(newRootId);
 }
 
 // ─────────────────────────────────────────────────────────
@@ -417,9 +598,9 @@ export function recordHistory(input: {
   errorCode: string | null;
 }) {
   const id = uuid();
-  // Mark dirty so the sync engine picks it up. The sync push only ships
-  // metadata (no response body bytes) — see engine.ts.
-  const dirty = isCloudWorkspace(input.workspaceId);
+  // History is device-private and never synced (it holds resolved auth
+  // headers and tokens). Never mark it dirty.
+  const dirty = false;
   getDb()
     .insert(historyEntries)
     .values({
@@ -760,6 +941,11 @@ export function applyPulledChange(
               url: (d.url as string) ?? existing.url,
               headers: JSON.stringify(d.headers ?? []),
               queryParams: JSON.stringify(d.queryParams ?? []),
+              // Older peers/backends don't send pathVariables; keep ours then.
+              pathVariables:
+                d.pathVariables !== undefined
+                  ? JSON.stringify(d.pathVariables)
+                  : existing.pathVariables,
               bodyType: (d.bodyType as string) ?? existing.bodyType,
               body: JSON.stringify(d.body ?? {}),
               auth: JSON.stringify(d.auth ?? { type: 'none' }),
@@ -790,6 +976,7 @@ export function applyPulledChange(
               url: (d.url as string) ?? '',
               headers: JSON.stringify(d.headers ?? []),
               queryParams: JSON.stringify(d.queryParams ?? []),
+              pathVariables: JSON.stringify(d.pathVariables ?? []),
               bodyType: (d.bodyType as string) ?? 'none',
               body: JSON.stringify(d.body ?? {}),
               auth: JSON.stringify(d.auth ?? { type: 'none' }),
@@ -1041,13 +1228,29 @@ export function getAutoHeaders(): AutoHeader[] {
   if (raw) {
     try {
       const parsed = JSON.parse(raw) as AutoHeader[];
-      if (Array.isArray(parsed)) return parsed;
+      if (Array.isArray(parsed)) {
+        // Keep only well-formed rows, then append any built-in that this
+        // build knows about but the stored list predates (e.g. a header
+        // added in an update) so users don't silently miss new defaults.
+        const items = parsed
+          .filter((h) => h && typeof h.key === 'string' && typeof h.value === 'string')
+          .map((h) => ({ ...h, enabled: h.enabled !== false }));
+        const have = new Set(items.map((h) => h.key.toLowerCase()));
+        for (const d of defaultAutoHeaders()) {
+          if (!have.has(d.key.toLowerCase())) items.push(d);
+        }
+        return items;
+      }
     } catch {
       /* fall through to defaults */
     }
   }
-  // Defaults — match what Postman/Insomnia send by convention so server logs
-  // look the same. Volt-Token is per-request UUID for correlation.
+  return defaultAutoHeaders();
+}
+
+/** Defaults — match what Postman/Insomnia send by convention so server logs
+ *  look the same. Volt-Token is per-request UUID for correlation. */
+function defaultAutoHeaders(): AutoHeader[] {
   return [
     {
       key: 'User-Agent',
@@ -1095,6 +1298,12 @@ export function getAutoHeaders(): AutoHeader[] {
 }
 
 export function setAutoHeaders(items: AutoHeader[]): void {
+  // An empty list means "reset to defaults": built-ins can't be removed from
+  // the UI, so the editor can never legitimately produce an empty list.
+  if (items.length === 0) {
+    deleteState(AUTO_HEADERS_KEY);
+    return;
+  }
   setState(AUTO_HEADERS_KEY, JSON.stringify(items));
 }
 
@@ -1128,6 +1337,7 @@ function parseRequest(row: typeof apiRequests.$inferSelect) {
     ...row,
     headers: safeJsonParse(row.headers, []),
     queryParams: safeJsonParse(row.queryParams, []),
+    pathVariables: safeJsonParse(row.pathVariables, []),
     body: safeJsonParse(row.body, { type: 'none' }),
     auth: safeJsonParse(row.auth, { type: 'none' }),
     examples: safeJsonParse(row.examples, []),

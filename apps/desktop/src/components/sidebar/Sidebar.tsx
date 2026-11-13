@@ -5,6 +5,7 @@ import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/Tabs';
 import { CollectionTree } from './CollectionTree';
 import { HistoryPane } from './HistoryPane';
 import { useModals } from '@/stores/modals';
+import { useSelection } from '@/stores/selection';
 
 interface Props {
   workspaceId: string;
@@ -16,6 +17,9 @@ interface Props {
  */
 export function Sidebar({ workspaceId }: Props) {
   const { open: openModal } = useModals();
+  // Controlled + persisted so the pane survives workspace switches / restarts.
+  const sidebarTab = useSelection((s) => s.sidebarTab);
+  const setSidebarTab = useSelection((s) => s.setSidebarTab);
 
   return (
     <div className="flex h-full flex-col border-r border-border bg-bg">
@@ -50,7 +54,11 @@ export function Sidebar({ workspaceId }: Props) {
       </div>
 
       {/* Tabs */}
-      <Tabs defaultValue="collections" className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <Tabs
+        value={sidebarTab}
+        onValueChange={(v) => setSidebarTab(v === 'history' ? 'history' : 'collections')}
+        className="flex min-h-0 flex-1 flex-col overflow-hidden"
+      >
         <TabsList>
           <TabsTrigger value="collections">Collections</TabsTrigger>
           <TabsTrigger value="history">History</TabsTrigger>

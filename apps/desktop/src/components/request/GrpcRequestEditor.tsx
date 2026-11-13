@@ -73,6 +73,17 @@ export function GrpcRequestEditor({ requestId }: Props) {
   // Local working copy of the gRPC body. Auto-saves to DB on a 500 ms debounce
   // (mirrors the pattern used by ExampleEditor in RequestEditor.tsx).
   const [body, setBody] = useState<GrpcBody>(EMPTY_BODY);
+  // Always-current body for flushes that run from stale closures (unmount,
+  // debounce timers). Without it the unmount flush captured the initial
+  // EMPTY_BODY and overwrote the saved request with defaults.
+  const bodyRef = useRef<GrpcBody>(EMPTY_BODY);
+  bodyRef.current = body;
+  const nameRef = useRef<string | null>(null);
+  // Updated in an effect (not during render) so the cleanup that runs when
+  // requestId changes still sees the *previous* id and flushes to that row.
+  const requestIdRef = useRef(requestId);
+  const updateRequestRef = useRef(updateRequest);
+  updateRequestRef.current = updateRequest;
   const lastLoadedRef = useRef<string | null>(null);
   const pendingSaveTimerRef = useRef<number | null>(null);
   const [saveStatus, setSaveStatus] = useState<'idle' | 'pending' | 'saving'>('idle');
@@ -130,11 +141,15 @@ export function GrpcRequestEditor({ requestId }: Props) {
         pendingSaveTimerRef.current = null;
       }
       setSaveStatus('saving');
-      const next = { ...body, ...patch };
-      updateRequest
+      // Read through the refs: `body` in this closure may predate edits made
+      // after the timer was scheduled (or be EMPTY_BODY on unmount).
+      const next = { ...bodyRef.current, ...patch };
+      const pendingName = patch.name ?? nameRef.current ?? undefined;
+      nameRef.current = null;
+      updateRequestRef.current
         .mutateAsync({
-          id: requestId,
-          ...(patch.name != null ? { name: patch.name } : {}),
+          id: requestIdRef.current,
+          ...(pendingName != null ? { name: pendingName } : {}),
           // Mirror address into the top-level url so the tab strip + sidebar
           // can show a meaningful label without learning about gRPC bodies.
           url: next.address,
@@ -152,36 +167,41 @@ export function GrpcRequestEditor({ requestId }: Props) {
         .then(() => setSaveStatus('idle'))
         .catch(() => setSaveStatus('pending'));
     },
-    [body, requestId, updateRequest],
+    [],
   );
 
   const scheduleSave = useCallback(
     (patch: Partial<GrpcBody> & { name?: string }) => {
       if (pendingSaveTimerRef.current != null) clearTimeout(pendingSaveTimerRef.current);
+      if (patch.name != null) nameRef.current = patch.name;
       setSaveStatus('pending');
       pendingSaveTimerRef.current = window.setTimeout(() => {
         pendingSaveTimerRef.current = null;
-        flushSave(patch);
+        // Body edits are already in bodyRef (patch() updates it synchronously);
+        // only the name travels separately.
+        flushSave({});
       }, 500);
     },
     [flushSave],
   );
 
-  // Flush on unmount so in-flight edits aren't dropped.
+  // Flush pending edits when the editor switches to another request or
+  // unmounts, so nothing is dropped and nothing lands on the wrong row.
   useEffect(() => {
+    requestIdRef.current = requestId;
     return () => {
       if (pendingSaveTimerRef.current != null) {
         clearTimeout(pendingSaveTimerRef.current);
-        // We use the current body+patch via a synchronous best-effort flush.
-        // The promise is fire-and-forget here.
+        pendingSaveTimerRef.current = null;
+        // Best-effort, fire-and-forget; reads the previous body + id via refs.
         flushSave({});
       }
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [requestId, flushSave]);
 
   const patch = useCallback(
     (p: Partial<GrpcBody>) => {
+      bodyRef.current = { ...bodyRef.current, ...p };
       setBody((cur) => ({ ...cur, ...p }));
       scheduleSave(p);
     },
@@ -229,11 +249,14 @@ export function GrpcRequestEditor({ requestId }: Props) {
   );
 
   // Auto-load on first paint when there's already a proto path stored.
+  // Guarded by `loading`: loadServicesNow changes identity on every body
+  // edit, which re-ran this effect and kicked off parallel loads.
   useEffect(() => {
-    if (services == null && body.protoPath) {
+    if (services == null && body.protoPath && !loading) {
       void loadServicesNow(body.protoPath);
     }
-  }, [services, body.protoPath, loadServicesNow]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [services, body.protoPath]);
 
   const selectedService = useMemo(
     () => services?.find((s) => s.name === body.service) ?? null,
@@ -273,7 +296,9 @@ export function GrpcRequestEditor({ requestId }: Props) {
       // we narrow manually via the runtime kind tag.
       const raw = evt as unknown as { kind?: string; connectionId?: string } & Record<string, unknown>;
       if (raw.kind !== 'grpc:stream:message' && raw.kind !== 'grpc:stream:state') return;
-      if (streamIdRef.current && raw.connectionId !== streamIdRef.current) return;
+      // Only the active stream's events; main defers the 'open' event until
+      // after the openStream reply so the id is always known here.
+      if (!streamIdRef.current || raw.connectionId !== streamIdRef.current) return;
       const timestamp = (raw.timestamp as number | undefined) ?? Date.now();
       if (raw.kind === 'grpc:stream:message') {
         const direction = raw.direction as 'in' | 'out';
@@ -433,7 +458,8 @@ export function GrpcRequestEditor({ requestId }: Props) {
         <Input
           value={body.address}
           onChange={(e) => patch({ address: e.target.value })}
-          placeholder="localhost:50051"
+          placeholder="localhost:50051  ·  grpcs://api.example.com:443 for TLS"
+          title="host:port (plaintext). Prefix with grpcs:// or use port 443 for TLS."
           className="flex-1"
           disabled={streamState === 'open' || streamState === 'connecting'}
         />

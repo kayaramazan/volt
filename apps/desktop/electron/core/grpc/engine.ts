@@ -5,6 +5,8 @@
 // renderer drives via IPC, server-to-client messages are pushed back as
 // `grpc:stream:*` events on the volt:event bus.
 
+import path from 'node:path';
+
 import * as grpc from '@grpc/grpc-js';
 import * as protoLoader from '@grpc/proto-loader';
 import { BrowserWindow } from 'electron';
@@ -38,12 +40,63 @@ export interface LoadProtoResult {
 
 export async function loadProto(protoPath: string): Promise<LoadProtoResult> {
   try {
-    const pkgDef = await protoLoader.load(protoPath, PROTO_LOADER_OPTIONS);
+    const pkgDef = await loadPackageDef(protoPath);
     const services = walkServices(pkgDef);
+    if (services.length === 0) {
+      return { ok: false, services: [], error: 'No services found in this .proto file (only messages/enums).' };
+    }
     return { ok: true, services };
   } catch (e) {
     return { ok: false, services: [], error: (e as Error).message };
   }
+}
+
+/** Loads a .proto with include paths set to the file's directory and its
+ *  ancestors, so `import "api/v1/common.proto"` style imports (rooted at the
+ *  repo root) resolve as well as sibling imports. proto-loader falls back to
+ *  origin-relative resolution when none of the include dirs match. */
+function loadPackageDef(protoPath: string): Promise<protoLoader.PackageDefinition> {
+  const includeDirs: string[] = [];
+  let dir = path.dirname(path.resolve(protoPath));
+  for (let i = 0; i < 8; i++) {
+    includeDirs.push(dir);
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return protoLoader.load(protoPath, { ...PROTO_LOADER_OPTIONS, includeDirs });
+}
+
+/** Accepts `host:port`, `grpc://host:port` (plaintext), `grpcs://` or
+ *  `https://` (TLS). A bare `host:443` is treated as TLS, matching Postman. */
+function parseAddress(raw: string): { target: string; creds: grpc.ChannelCredentials } {
+  let s = raw.trim();
+  let tls: boolean | null = null;
+  const m = /^([a-z]+):\/\//i.exec(s);
+  if (m) {
+    const scheme = m[1]!.toLowerCase();
+    if (scheme === 'grpcs' || scheme === 'https') tls = true;
+    else if (scheme === 'grpc' || scheme === 'http') tls = false;
+    else throw new Error(`Unsupported address scheme "${scheme}://" — use host:port, grpc:// or grpcs://`);
+    s = s.slice(m[0].length);
+  }
+  // Drop any path/query the user may have pasted from a browser URL.
+  s = s.replace(/[/?#].*$/, '');
+  if (!s) throw new Error('Address is empty.');
+  if (tls === null) tls = /:443$/.test(s);
+  return { target: s, creds: tls ? grpc.credentials.createSsl() : grpc.credentials.createInsecure() };
+}
+
+function buildMetadata(input?: Record<string, string>): grpc.Metadata {
+  const metadata = new grpc.Metadata();
+  for (const [k, v] of Object.entries(input ?? {})) {
+    const key = k.trim();
+    if (!key) continue;
+    // Binary metadata must be a Buffer; the UI supplies it base64-encoded.
+    if (key.toLowerCase().endsWith('-bin')) metadata.add(key, Buffer.from(v, 'base64'));
+    else metadata.add(key, v);
+  }
+  return metadata;
 }
 
 function walkServices(pkgDef: protoLoader.PackageDefinition): GrpcServiceInfo[] {
@@ -105,7 +158,7 @@ export type InvokeUnaryResult =
 export async function invokeUnary(input: InvokeUnaryInput): Promise<InvokeUnaryResult> {
   const start = Date.now();
   try {
-    const pkgDef = await protoLoader.load(input.protoPath, PROTO_LOADER_OPTIONS);
+    const pkgDef = await loadPackageDef(input.protoPath);
     const serviceDef = pkgDef[input.service];
     if (!serviceDef || !isServiceDefinition(serviceDef)) {
       return failure('SERVICE_NOT_FOUND', `Service "${input.service}" not found in proto.`, start);
@@ -144,12 +197,10 @@ export async function invokeUnary(input: InvokeUnaryInput): Promise<InvokeUnaryR
         start,
       );
     }
-    const client = new SvcCtor(input.address, grpc.credentials.createInsecure());
+    const { target, creds } = parseAddress(input.address);
+    const client = new SvcCtor(target, creds);
 
-    const metadata = new grpc.Metadata();
-    for (const [k, v] of Object.entries(input.metadata ?? {})) {
-      metadata.add(k, v);
-    }
+    const metadata = buildMetadata(input.metadata);
     const timeoutMs = input.timeoutMs ?? 30_000;
     const callOptions: grpc.CallOptions = {
       deadline: Date.now() + timeoutMs,
@@ -158,6 +209,12 @@ export async function invokeUnary(input: InvokeUnaryInput): Promise<InvokeUnaryR
     return await new Promise<InvokeUnaryResult>((resolve) => {
       const handler = (err: grpc.ServiceError | null, response: unknown) => {
         const durationMs = Date.now() - start;
+        // One-shot client: release the channel so we don't leak a socket per call.
+        try {
+          client.close();
+        } catch {
+          /* ignore */
+        }
         if (err) {
           resolve({
             ok: false,
@@ -174,6 +231,7 @@ export async function invokeUnary(input: InvokeUnaryInput): Promise<InvokeUnaryR
       // so it matches the .proto exactly).
       const methodFn = (client as unknown as Record<string, unknown>)[input.method];
       if (typeof methodFn !== 'function') {
+        client.close();
         resolve(failure('METHOD_NOT_FOUND', `Client has no method "${input.method}".`, start));
         return;
       }
@@ -273,7 +331,7 @@ export type OpenStreamResult =
 
 export async function openStream(input: OpenStreamInput): Promise<OpenStreamResult> {
   try {
-    const pkgDef = await protoLoader.load(input.protoPath, PROTO_LOADER_OPTIONS);
+    const pkgDef = await loadPackageDef(input.protoPath);
     const serviceDef = pkgDef[input.service];
     if (!serviceDef || !isServiceDefinition(serviceDef)) {
       return { ok: false, errorCode: 'SERVICE_NOT_FOUND', errorMessage: `Service "${input.service}" not found.` };
@@ -309,9 +367,11 @@ export async function openStream(input: OpenStreamInput): Promise<OpenStreamResu
         errorMessage: `Could not resolve service constructor for "${input.service}".`,
       };
     }
-    const client = new SvcCtor(input.address, grpc.credentials.createInsecure());
+    const { target, creds } = parseAddress(input.address);
+    const client = new SvcCtor(target, creds);
     const methodFn = (client as unknown as Record<string, unknown>)[input.method];
     if (typeof methodFn !== 'function') {
+      client.close();
       return {
         ok: false,
         errorCode: 'METHOD_NOT_FOUND',
@@ -319,8 +379,7 @@ export async function openStream(input: OpenStreamInput): Promise<OpenStreamResu
       };
     }
 
-    const metadata = new grpc.Metadata();
-    for (const [k, v] of Object.entries(input.metadata ?? {})) metadata.add(k, v);
+    const metadata = buildMetadata(input.metadata);
 
     // For server-streaming the first request is provided up front; bidi
     // accepts an optional first frame; client-streaming sends nothing here.
@@ -359,41 +418,46 @@ export async function openStream(input: OpenStreamInput): Promise<OpenStreamResu
           handleStreamError(connectionId, err);
         } else {
           emitStreamMessage(connectionId, 'in', resp);
+          // A writable stream never emits 'end' — the single response *is*
+          // the end of the call, so close out the record here or the UI
+          // would sit at "live" forever.
+          finishStream(connectionId);
         }
       });
     } else {
       // bidi: (metadata, options) → ClientDuplexStream
       call = (methodFn as (meta: grpc.Metadata) => GrpcCall).call(client, metadata);
-      // If the user supplied an initial frame for a bidi call, write it now.
+      // If the user supplied an initial frame for a bidi call, write it now
+      // (the log entry for it is emitted after 'open' below).
       if (initialMessage !== undefined && call.write) {
         call.write(initialMessage);
-        emitStreamMessage(connectionId, 'out', initialMessage);
       }
     }
 
     streams.set(connectionId, { call, client, mode, state: 'open' });
-    emitStreamState(connectionId, 'open');
+    // Emit 'open' (and the bidi initial frame) on the next tick so the IPC
+    // reply carrying connectionId reaches the renderer before the first
+    // event — the editor filters events by id and would otherwise drop them.
+    const initialOut = mode === 'bidi' && initialMessage !== undefined ? initialMessage : undefined;
+    setImmediate(() => {
+      if (!streams.has(connectionId)) return;
+      emitStreamState(connectionId, 'open');
+      if (initialOut !== undefined) emitStreamMessage(connectionId, 'out', initialOut);
+    });
 
     call.on('data', (msg: unknown) => {
-      emitStreamMessage(connectionId, 'in', msg);
+      if (streams.has(connectionId)) emitStreamMessage(connectionId, 'in', msg);
     });
     call.on('error', (err: Error) => {
       handleStreamError(connectionId, err);
     });
     call.on('end', () => {
-      const rec = streams.get(connectionId);
-      if (!rec || rec.state === 'error') return;
-      rec.state = 'closed';
-      emitStreamState(connectionId, 'closed');
-      streams.delete(connectionId);
-      try {
-        rec.client.close();
-      } catch {
-        /* ignore */
-      }
+      finishStream(connectionId);
     });
     call.on('status', (status) => {
       // Pass status codes through so the UI can show e.g. "UNAVAILABLE".
+      // Skipped once the record is gone (user cancelled / already errored).
+      if (!streams.has(connectionId)) return;
       const code = grpc.status[status.code] ?? String(status.code);
       if (status.code !== grpc.status.OK) {
         emitStreamState(connectionId, 'status', { code, details: status.details ?? null });
@@ -467,17 +531,32 @@ export function streamClose(connectionId: string): { ok: boolean } {
   return { ok: true };
 }
 
+/** Normal end of a stream (server finished, or client-stream got its reply). */
+function finishStream(connectionId: string) {
+  const rec = streams.get(connectionId);
+  if (!rec) return;
+  rec.state = 'closed';
+  streams.delete(connectionId);
+  try {
+    rec.client.close();
+  } catch {
+    /* ignore */
+  }
+  emitStreamState(connectionId, 'closed');
+}
+
 function handleStreamError(connectionId: string, err: Error) {
   const rec = streams.get(connectionId);
-  if (rec) {
-    rec.state = 'error';
-    try {
-      rec.client.close();
-    } catch {
-      /* ignore */
-    }
-    streams.delete(connectionId);
+  // No record → the user already closed it (cancel surfaces as a CANCELLED
+  // error) or it finished; don't flip the UI to "error" after the fact.
+  if (!rec) return;
+  rec.state = 'error';
+  try {
+    rec.client.close();
+  } catch {
+    /* ignore */
   }
+  streams.delete(connectionId);
   const code = (err as grpc.ServiceError).code;
   emitStreamState(connectionId, 'error', {
     code: code != null ? grpc.status[code] ?? String(code) : 'ERROR',

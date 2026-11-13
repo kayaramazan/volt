@@ -94,9 +94,13 @@ export function NewRequestModal() {
       url: url.trim(),
     } as Parameters<typeof createRequest.mutateAsync>[0];
 
+    // On failure the hook toasts; we get null back and keep the modal open.
+    const create = (input: Parameters<typeof createRequest.mutateAsync>[0]) =>
+      createRequest.mutateAsync(input).catch(() => null);
+
     let r;
     if (kind === 'graphql') {
-      r = await createRequest.mutateAsync({
+      r = await create({
         ...base,
         method: 'POST',
         // bodyType + body shape are stripped by the create contract's optional
@@ -110,7 +114,7 @@ export function NewRequestModal() {
       // server address (e.g., "localhost:50051") so it shows up in the tab
       // strip; `method` is a no-op sentinel. The actual call details live
       // in body.* (service, method, message, metadata, proto path).
-      r = await createRequest.mutateAsync({
+      r = await create({
         ...base,
         method: 'POST',
         url: url.trim() || 'localhost:50051',
@@ -126,12 +130,13 @@ export function NewRequestModal() {
         },
       } as never);
     } else {
-      r = await createRequest.mutateAsync({
+      r = await create({
         ...base,
         method,
       });
     }
-    if (r?.id) selectRequest(r.id);
+    if (!r) return;
+    selectRequest(r.id);
     reset();
     close();
   }

@@ -116,6 +116,10 @@ export function ImportModal() {
         hint: pasteDetection.hint,
         content: paste,
       });
+    } else {
+      // Paste cleared or no longer recognized — don't leave a stale badge
+      // (and an enabled Import button) pointing at content that's gone.
+      setSource((prev) => (prev && prev.content !== undefined ? null : prev));
     }
   }, [paste, pasteDetection]);
 
@@ -169,6 +173,7 @@ export function ImportModal() {
   async function runImport() {
     if (!workspaceId || !source) return;
     setRunning(true);
+    setError(null);
     try {
       const r = (await voltApi['import:source']({
         workspaceId,
@@ -182,6 +187,10 @@ export function ImportModal() {
         qc.invalidateQueries({ queryKey: ['requests', workspaceId] });
         qc.invalidateQueries({ queryKey: ['environments', workspaceId] });
       }
+    } catch (e) {
+      // IPC rejection (validation failure, main-process crash) — surface it
+      // instead of silently leaving the user on the same screen.
+      setError(`Import failed: ${(e as Error).message}`);
     } finally {
       setRunning(false);
     }
@@ -250,6 +259,11 @@ export function ImportModal() {
               placeholder='curl https://api.example.com … &#10;{ "info": { "schema": "https://schema.getpostman.com/…" } }&#10;openapi: 3.0.3'
               className="h-28 w-full resize-none rounded-md border border-border bg-bg-elevated px-2 py-1.5 font-mono text-[11px] text-text outline-none placeholder:text-text-muted focus:ring-1 focus:ring-accent"
             />
+            {paste.trim() && !pasteDetection && (
+              <p className="mt-1 text-[10px] text-warning">
+                Not recognized yet — expected a cURL command, Postman collection/environment, Insomnia export, OpenAPI/Swagger spec, or HAR.
+              </p>
+            )}
           </div>
 
           {/* Detection badge */}

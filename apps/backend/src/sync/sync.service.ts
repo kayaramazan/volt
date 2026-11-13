@@ -129,10 +129,10 @@ export class SyncService {
         where: { workspaceId, revision: { gt: since } },
         orderBy: { revision: 'asc' },
       }),
-      prisma.historyEntry.findMany({
-        where: { workspaceId, revision: { gt: since } },
-        orderBy: { revision: 'asc' },
-      }),
+      // History is device-private (snapshots carry resolved auth headers and
+      // tokens). Never hand it to other members, including rows uploaded by
+      // older desktop builds.
+      Promise.resolve([] as never[]),
     ]);
 
     // Merge by revision asc into a single ordered stream.
@@ -278,6 +278,7 @@ export class SyncService {
             url: (data.url as string) ?? '',
             headers: (data.headers as object) ?? [],
             queryParams: (data.queryParams as object) ?? [],
+            pathVariables: (data.pathVariables as object) ?? [],
             bodyType: (data.bodyType as string) ?? 'none',
             body: (data.body as object) ?? {},
             auth: (data.auth as object) ?? { type: 'none' },
@@ -295,6 +296,7 @@ export class SyncService {
             url: (data.url as string) ?? existing?.url ?? '',
             headers: (data.headers as object) ?? existing?.headers ?? [],
             queryParams: (data.queryParams as object) ?? existing?.queryParams ?? [],
+            pathVariables: (data.pathVariables as object) ?? existing?.pathVariables ?? [],
             bodyType: (data.bodyType as string) ?? existing?.bodyType ?? 'none',
             body: (data.body as object) ?? existing?.body ?? {},
             auth: (data.auth as object) ?? existing?.auth ?? { type: 'none' },
@@ -340,40 +342,9 @@ export class SyncService {
         break;
       }
       case 'history': {
-        // History is append-mostly; we don't log a conflict on every push.
-        // Only `pinned` is realistically edited after creation.
-        const existing = await tx.historyEntry.findUnique({ where: { id: rowId } });
-        if (existing && existing.workspaceId !== workspaceId) {
-          throw new AppError('WORKSPACE_NOT_FOUND', 403);
-        }
-        const startedAt = data.startedAt
-          ? new Date(typeof data.startedAt === 'number' ? data.startedAt : (data.startedAt as string))
-          : new Date();
-        await tx.historyEntry.upsert({
-          where: { id: rowId },
-          create: {
-            id: rowId,
-            workspaceId,
-            requestId: (data.requestId as string | null) ?? null,
-            method: (data.method as string) ?? 'GET',
-            url: (data.url as string) ?? '',
-            requestSnapshot: (data.requestSnapshot as object) ?? {},
-            statusCode: (data.statusCode as number | null) ?? null,
-            responseHeaders: (data.responseHeaders as object | null) ?? Prisma.JsonNull,
-            responseSizeBytes: (data.responseSizeBytes as number | null) ?? null,
-            responseContentType: (data.responseContentType as string | null) ?? null,
-            startedAt,
-            durationMs: (data.durationMs as number) ?? 0,
-            errorCode: (data.errorCode as string | null) ?? null,
-            pinned: Boolean(data.pinned ?? false),
-            revision: newRevision,
-          },
-          update: {
-            pinned: Boolean(data.pinned ?? existing?.pinned ?? false),
-            revision: newRevision,
-            deletedAt: null,
-          },
-        });
+        // History is device-private and must not be stored server-side.
+        // Older desktop builds still upload it: accept the change (so their
+        // dirty flags clear) but drop the data.
         break;
       }
     }
@@ -503,6 +474,7 @@ export class SyncService {
     url: string;
     headers: unknown;
     queryParams: unknown;
+    pathVariables: unknown;
     bodyType: string;
     body: unknown;
     auth: unknown;
@@ -535,6 +507,7 @@ export class SyncService {
         url: r.url,
         headers: r.headers,
         queryParams: r.queryParams,
+        pathVariables: r.pathVariables,
         bodyType: r.bodyType,
         body: r.body,
         auth: r.auth,

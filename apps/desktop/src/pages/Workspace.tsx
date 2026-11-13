@@ -1,4 +1,6 @@
+import { useEffect } from 'react';
 import { Panel, PanelGroup, PanelResizeHandle } from 'react-resizable-panels';
+import { useQueryClient } from '@tanstack/react-query';
 
 import { Sidebar } from '@/components/sidebar/Sidebar';
 import { RequestEditor } from '@/components/request/RequestEditor';
@@ -7,7 +9,7 @@ import { ResponseViewer } from '@/components/response/ResponseViewer';
 import { TabStrip } from '@/components/layout/TabStrip';
 import { EmptyState } from '@/components/layout/EmptyState';
 import { ConflictBanner } from '@/components/conflict/ConflictBanner';
-import { useRequest } from '@/hooks/useData';
+import { useRequest, useRequests } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
 import { useDrafts } from '@/stores/drafts';
 
@@ -21,10 +23,26 @@ interface Props {
  * vertically.
  */
 export function Workspace({ workspaceId }: Props) {
-  const { requestId, responsePanelOpen, sidebarOpen, setResponsePanelOpen } = useSelection();
+  const { requestId, responsePanelOpen, sidebarOpen, setResponsePanelOpen, pruneTabs } =
+    useSelection();
   const setLastResponse = useDrafts((s) => s.setLastResponse);
   const lastResponses = useDrafts((s) => s.lastResponses);
   const inFlight = useDrafts((s) => s.inFlight);
+  const qc = useQueryClient();
+
+  // Keep the persisted tab list honest: a request can disappear underneath
+  // an open tab (deleted from the sidebar, removed by a sync pull, parent
+  // collection deleted, local DB recreated). The list query is the source of
+  // truth for "what exists" — prune whenever it changes.
+  const { data: requests } = useRequests(workspaceId);
+  useEffect(() => {
+    if (!requests) return;
+    const ids = new Set(requests.map((r) => r.id));
+    pruneTabs(ids);
+    // Drop drafts/responses for anything that's gone so they don't resurface.
+    const { drafts, forgetRequest } = useDrafts.getState();
+    for (const id of drafts.keys()) if (!ids.has(id)) forgetRequest(id);
+  }, [requests, pruneTabs]);
 
   // Each request's last response is cached by requestId in the drafts store,
   // so switching between requests shows each one's own response (or nothing
@@ -57,6 +75,8 @@ export function Workspace({ workspaceId }: Props) {
                 onResponse={(r) => {
                   setLastResponse(requestId, r);
                   setResponsePanelOpen(true);
+                  // Main just recorded a history row — refresh the History pane.
+                  qc.invalidateQueries({ queryKey: ['history', workspaceId] });
                 }}
                 response={response}
                 sending={sending}

@@ -1,10 +1,20 @@
+import { useEffect, useState, type FormEvent } from 'react';
 import { LogOut, Monitor, Trash2, Users } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 
 import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
+import { Input } from '@/components/ui/Input';
 import { useModals } from '@/stores/modals';
-import { useAppInfo, useAuthStatus, useSignOut } from '@/hooks/useData';
+import { useSelection } from '@/stores/selection';
+import {
+  useAppInfo,
+  useAuthStatus,
+  useDeleteWorkspace,
+  useRenameWorkspace,
+  useSignOut,
+  useWorkspaces,
+} from '@/hooks/useData';
 import { useTheme, type ThemePref } from '@/stores/theme';
 import { Select } from '@/components/ui/Select';
 import { formatRelativeTime } from '@/lib/util';
@@ -115,6 +125,13 @@ export function SettingsModal() {
 
         <section>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">
+            Workspace
+          </h3>
+          <WorkspaceSection open={isOpen} onClose={close} />
+        </section>
+
+        <section>
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">
             Appearance
           </h3>
           <ThemePicker />
@@ -158,6 +175,90 @@ export function SettingsModal() {
         )}
       </div>
     </Dialog>
+  );
+}
+
+/**
+ * Rename / delete the currently selected workspace. Postman exposes this via
+ * "Workspace settings"; we keep it inside Settings so the top bar stays lean.
+ */
+function WorkspaceSection({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const workspaceId = useSelection((s) => s.workspaceId);
+  const { data: workspaces } = useWorkspaces();
+  const rename = useRenameWorkspace();
+  const remove = useDeleteWorkspace();
+  const all = [...(workspaces?.personal ?? []), ...(workspaces?.team ?? [])];
+  const current = all.find((w) => w.id === workspaceId) ?? null;
+  const [name, setName] = useState('');
+
+  // Re-seed the input whenever the modal opens or the selection changes.
+  useEffect(() => {
+    if (open) setName(current?.name ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, current?.id]);
+
+  if (!current) {
+    return (
+      <div className="rounded-md border border-border bg-bg p-3 text-xs text-text-muted">
+        No workspace selected.
+      </div>
+    );
+  }
+
+  const trimmed = name.trim();
+  const dirty = trimmed.length > 0 && trimmed !== current.name;
+
+  async function submitRename(e: FormEvent) {
+    e.preventDefault();
+    if (!current || !dirty) return;
+    try {
+      await rename.mutateAsync({ id: current.id, name: trimmed });
+    } catch {
+      /* toast raised by the hook */
+    }
+  }
+
+  async function confirmDelete() {
+    if (!current) return;
+    const ok = confirm(
+      `Delete workspace "${current.name}"?\n\nAll of its collections, requests, environments and history on this device will be removed. This cannot be undone.`,
+    );
+    if (!ok) return;
+    try {
+      await remove.mutateAsync(current.id);
+      onClose();
+    } catch {
+      /* toast raised by the hook */
+    }
+  }
+
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-bg p-3">
+      <form onSubmit={submitRename} className="flex items-end gap-2">
+        <div className="flex-1">
+          <label className="mb-1 block text-xs text-text-muted">Name</label>
+          <Input value={name} onChange={(e) => setName(e.target.value)} maxLength={120} />
+        </div>
+        <Button variant="primary" size="md" type="submit" disabled={!dirty || rename.isPending}>
+          Rename
+        </Button>
+      </form>
+      <div className="flex items-center justify-between pt-1">
+        <p className="text-[11px] text-text-muted">
+          {current.ownerTeamId ? 'Team workspace' : 'Personal workspace'}
+        </p>
+        <Button
+          variant="danger"
+          size="sm"
+          onClick={confirmDelete}
+          disabled={remove.isPending}
+          title="Delete this workspace and everything in it"
+        >
+          <Trash2 size={12} />
+          Delete workspace
+        </Button>
+      </div>
+    </div>
   );
 }
 

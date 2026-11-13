@@ -1,15 +1,18 @@
 import { useState, useEffect } from 'react';
 
 import { TopBar } from '@/components/layout/TopBar';
+import { Toaster } from '@/components/layout/Toaster';
 import { Workspace } from '@/pages/Workspace';
 import { AuthScreen } from '@/pages/AuthScreen';
 import { WelcomePage } from '@/pages/WelcomePage';
 import { useAuthStatus, useWorkspaces } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
 import { useModals } from '@/stores/modals';
+import { useDrafts } from '@/stores/drafts';
 import { useHotkey } from '@/hooks/useHotkey';
 import { useSyncEvents } from '@/hooks/useSyncEvents';
 import { useMenuEvents } from '@/hooks/useMenuEvents';
+import { useWidgetBridge } from '@/hooks/useWidgetBridge';
 
 // Modals
 import { NewWorkspaceModal } from '@/components/modals/NewWorkspaceModal';
@@ -47,7 +50,7 @@ const ONBOARDED_KEY = 'volt:onboarded';
  */
 export function App() {
   const { data: authStatus, isLoading } = useAuthStatus();
-  const { workspaceId, setWorkspaceId, selectRequest } = useSelection();
+  const { workspaceId, setWorkspaceId, selectRequest, toggleSidebar } = useSelection();
   const { data: workspaces } = useWorkspaces();
   const { open: openModal } = useModals();
 
@@ -79,18 +82,36 @@ export function App() {
   // Wire up sync event broadcasting → query invalidation
   useSyncEvents();
   useMenuEvents();
+  useWidgetBridge();
 
   // Global keyboard shortcuts
   useHotkey('mod+k', () => openModal({ kind: 'command-palette' }));
   useHotkey('mod+p', () => openModal({ kind: 'global-search' }));
   useHotkey('mod+n', () => openModal({ kind: 'new-request', collectionId: null }));
   useHotkey('mod+,', () => openModal({ kind: 'settings' }), { allowInInputs: true });
+  // Cmd/Ctrl+\ toggles the sidebar (same binding as Postman).
+  useHotkey('mod+\\', toggleSidebar, { allowInInputs: true });
 
-  // Auto-select the first workspace once data loads
+  // Drafts and cached responses are per-request; switching workspace closes
+  // every tab, so drop them too (otherwise re-opening a request later shows
+  // stale unsaved edits from the previous session in that workspace).
   useEffect(() => {
-    if (workspaceId || !workspaces) return;
-    const first = workspaces.personal[0] ?? workspaces.team[0];
-    if (first) setWorkspaceId(first.id);
+    useDrafts.getState().clearAll();
+  }, [workspaceId]);
+
+  // Auto-select the first workspace once data loads. Also reset the
+  // persisted selection if it points to a workspace that no longer exists
+  // (deleted locally, removed via sync, or local DB recreated) — otherwise
+  // downstream writes (import, create request, …) fail the workspace FK.
+  useEffect(() => {
+    if (!workspaces) return;
+    const all = [...workspaces.personal, ...workspaces.team];
+    const stillExists = workspaceId ? all.some((w) => w.id === workspaceId) : false;
+    if (workspaceId && !stillExists) {
+      setWorkspaceId(all[0]?.id ?? null);
+      return;
+    }
+    if (!workspaceId && all[0]) setWorkspaceId(all[0].id);
   }, [workspaceId, workspaces, setWorkspaceId]);
 
   if (isLoading) {
@@ -187,6 +208,7 @@ export function App() {
       <MockSettingsModal />
       <PluginsModal />
       <ConflictsModal />
+      <Toaster />
     </div>
   );
 }

@@ -9,11 +9,13 @@ import { Button } from '@/components/ui/Button';
 import { useRequest, useUpdateRequest } from '@/hooks/useData';
 import { useModals } from '@/stores/modals';
 import { cn } from '@/lib/util';
+import { useEffectiveTheme } from '@/stores/theme';
 
 type ViewMode = 'edit' | 'split' | 'preview';
 
 /** Per-request markdown documentation editor. Mirrors CollectionDocsModal. */
 export function RequestDocsModal() {
+  const editorTheme = useEffectiveTheme();
   const { current, close } = useModals();
   const isOpen = current.kind === 'request-docs';
   const requestId = current.kind === 'request-docs' ? current.requestId : null;
@@ -24,10 +26,16 @@ export function RequestDocsModal() {
   const [draft, setDraft] = useState('');
   const [mode, setMode] = useState<ViewMode>('split');
 
+  // Seed the editor when the modal opens or targets a different request.
+  // Deliberately NOT keyed on the `request` object: a background refetch of
+  // ['request', id] (sync pull, Save elsewhere) would otherwise wipe the
+  // user's in-progress edits.
+  const loaded = !!request;
   useEffect(() => {
     if (!isOpen || !request) return;
     setDraft((request as { description?: string }).description ?? '');
-  }, [isOpen, request]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, requestId, loaded]);
 
   const dirty =
     (request && ((request as { description?: string }).description ?? '') !== draft) || false;
@@ -81,7 +89,7 @@ export function RequestDocsModal() {
                   value={draft}
                   onChange={(v) => setDraft(v)}
                   extensions={[markdown()]}
-                  theme="dark"
+                  theme={editorTheme}
                   basicSetup={{
                     lineNumbers: false,
                     foldGutter: false,

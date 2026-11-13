@@ -17,10 +17,14 @@ export function NewWorkspaceModal() {
   async function submit(e: FormEvent) {
     e.preventDefault();
     if (!name.trim()) return;
-    const result = await createWorkspace.mutateAsync({ name: name.trim() });
-    if (result?.id) setWorkspaceId(result.id);
-    setName('');
-    close();
+    try {
+      const result = await createWorkspace.mutateAsync({ name: name.trim() });
+      if (result?.id) setWorkspaceId(result.id);
+      setName('');
+      close();
+    } catch {
+      // Hook already toasts the error; keep the modal open so the user can retry.
+    }
   }
 
   return (

@@ -12,6 +12,7 @@ import { AuthEditor } from './AuthEditor';
 import { CodeEditor } from './CodeEditor';
 import { AutoHeadersEditor } from '@/components/modals/AutoHeadersEditor';
 import { VariablesProvider } from '@/lib/variables-context';
+import { buildVariableMap, substituteVariables, type ScopeCollection } from '@/lib/variables';
 import {
   useActiveEnv,
   useCollections,
@@ -41,6 +42,14 @@ const METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
  * Send executes the request (using draft state, even unsaved) and streams
  * the response to the parent.
  */
+/**
+ * Per-request snapshot (JSON) of the draft as it was built from the last
+ * saved row we showed. Lets us tell "the user edited this" apart from "a
+ * teammate changed the saved row underneath us". Module-level so it survives
+ * tab switches, like the drafts store.
+ */
+const draftBaselines = new Map<string, string>();
+
 export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
   const { data: saved, isLoading } = useRequest(requestId);
   const updateRequest = useUpdateRequest();
@@ -55,10 +64,13 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
   const draft = drafts.get(requestId);
   const sendIdRef = useRef<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [sendSettings, patchSendSettings] = useSendSettings();
 
   // Active editor tab. Controlled so we can jump to "examples" automatically
   // when the user clicks an example row in the sidebar.
   const [tab, setTab] = useState<string>('params');
+  // Set when a teammate changed this request while the user has unsaved edits.
+  const [remoteChange, setRemoteChange] = useState<{ requestId: string; next: unknown } | null>(null);
   const selectedExampleId = useSelection((s) => s.selectedExampleId);
   const setSelectedExampleId = useSelection((s) => s.setSelectedExampleId);
 
@@ -169,6 +181,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
     url: string;
     headers: Array<{ key: string; value: string }>;
     queryParams: Array<{ key: string; value: string }>;
+    pathVariables: QpRow[];
     bodyType: string;
     body: unknown;
     auth: unknown;
@@ -180,6 +193,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         url: exampleWorking!.example.request.url,
         headers: exampleWorking!.example.request.headers ?? [],
         queryParams: exampleWorking!.example.request.queryParams ?? [],
+        pathVariables: exampleWorking!.example.request.pathVariables ?? [],
         bodyType: exampleWorking!.example.request.bodyType ?? 'none',
         body: exampleWorking!.example.request.body,
         auth: exampleWorking!.example.request.auth ?? { type: 'none' },
@@ -191,6 +205,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         url: draft?.url ?? '',
         headers: (draft?.headers as Array<{ key: string; value: string }>) ?? [],
         queryParams: (draft?.queryParams as Array<{ key: string; value: string }>) ?? [],
+        pathVariables: ((draft as { pathVariables?: QpRow[] } | undefined)?.pathVariables) ?? [],
         bodyType: draft?.bodyType ?? 'none',
         body: draft?.body,
         auth: draft?.auth ?? { type: 'none' },
@@ -219,6 +234,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         url: string;
         headers: unknown;
         queryParams: unknown;
+        pathVariables: unknown;
         bodyType: string;
         body: unknown;
         auth: unknown;
@@ -272,74 +288,67 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
     }
   }, [selectedExampleId, saved]);
 
-  // Initialize draft when saved loads or request changes
+  // Initialize the draft when the saved row loads, and keep it live when a
+  // teammate's change arrives through sync:
+  //   - no local edits  → adopt their version silently;
+  //   - local edits     → keep the user's draft and show a banner to choose.
   useEffect(() => {
     if (!saved) return;
-    if (!drafts.has(requestId)) {
-      setDraft(requestId, {
-        name: saved.name,
-        method: saved.method,
-        url: saved.url,
-        headers: saved.headers as never,
-        queryParams: saved.queryParams as never,
-        bodyType: (saved as { bodyType?: string }).bodyType ?? (saved.body as { type?: string })?.type ?? 'none',
-        body: saved.body,
-        auth: saved.auth,
-        preRequestScript: (saved as { preRequestScript?: string }).preRequestScript ?? '',
-        postResponseScript: (saved as { postResponseScript?: string }).postResponseScript ?? '',
-      });
+    // Bring URL bar and Params table into agreement (Postman keeps them
+    // synced). Pairs typed only into the URL of an older request become
+    // rows; the URL is then rewritten from the rows.
+    const mergedQp = mergeUrlQueryIntoRows(saved.url, (saved.queryParams as QpRow[]) ?? []);
+    const fromSaved = {
+      name: saved.name,
+      method: saved.method,
+      url: buildUrlFromParams(saved.url, mergedQp),
+      headers: saved.headers as never,
+      queryParams: mergedQp as never,
+      pathVariables: ((saved as { pathVariables?: QpRow[] }).pathVariables ?? []) as never,
+      bodyType: (saved as { bodyType?: string }).bodyType ?? (saved.body as { type?: string })?.type ?? 'none',
+      body: saved.body,
+      auth: saved.auth,
+      preRequestScript: (saved as { preRequestScript?: string }).preRequestScript ?? '',
+      postResponseScript: (saved as { postResponseScript?: string }).postResponseScript ?? '',
+    };
+    const nextJson = JSON.stringify(fromSaved);
+    const current = drafts.get(requestId);
+    const baseline = draftBaselines.get(requestId);
+    if (!current) {
+      setDraft(requestId, fromSaved as never);
+      draftBaselines.set(requestId, nextJson);
+      return;
     }
+    const currentJson = JSON.stringify(current);
+    if (nextJson === baseline) return; // saved row unchanged in substance
+    if (currentJson === nextJson) {
+      // Our own save came back (or both sides converged).
+      draftBaselines.set(requestId, nextJson);
+      setRemoteChange(null);
+      return;
+    }
+    if (currentJson === baseline) {
+      // No local edits: follow the server.
+      setDraft(requestId, fromSaved as never);
+      draftBaselines.set(requestId, nextJson);
+      setRemoteChange(null);
+      return;
+    }
+    // Local edits AND a remote change: don't clobber either side silently.
+    setRemoteChange({ requestId, next: fromSaved });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId, saved]);
 
-  // Merged variable map (globals → env → collection chain). Each entry carries
+  // Merged variable map (globals → collection chain → env). Each entry carries
   // not just the value but also which scope it was resolved from, so the
-  // VarEditor popover knows where to persist edits. Precedence: deepest
-  // collection > shallower collection > env > globals (later writes win).
+  // VarEditor popover knows where to persist edits. Precedence (Postman):
+  // env > deepest collection > shallower collection > globals.
   const variableMap = useMemo(() => {
     const env = environments?.find((e) => e.id === activeEnv?.environmentId) ?? null;
     const chain = saved?.collectionId
-      ? (collectColChain(saved.collectionId, collections ?? []) as Array<{
-          id: string;
-          name?: string;
-          variables?: Array<{ key: string; value: string }>;
-        }>)
+      ? (collectColChain(saved.collectionId, collections ?? []) as ScopeCollection[])
       : [];
-    const m = new Map<string, import('@/lib/variables-context').VarInfo>();
-    for (const [k, v] of Object.entries(globals ?? {})) {
-      if (v != null) {
-        m.set(k, {
-          value: typeof v === 'string' ? v : JSON.stringify(v),
-          scope: 'globals',
-          scopeId: null,
-          scopeName: 'Globals',
-        });
-      }
-    }
-    if (env?.variables) {
-      for (const v of env.variables as Array<{ key: string; value: string }>) {
-        m.set(v.key, {
-          value: v.value,
-          scope: 'env',
-          scopeId: env.id,
-          scopeName: env.name,
-        });
-      }
-    }
-    // Iterate the chain in reverse so deepest collection wins.
-    for (const c of [...chain].reverse()) {
-      if (c.variables) {
-        for (const v of c.variables) {
-          m.set(v.key, {
-            value: v.value,
-            scope: 'collection',
-            scopeId: c.id,
-            scopeName: c.name ?? 'Collection',
-          });
-        }
-      }
-    }
-    return m;
+    return buildVariableMap(globals, env, chain);
   }, [globals, environments, activeEnv?.environmentId, collections, saved?.collectionId]);
 
   const activeEnvName = useMemo(() => {
@@ -358,6 +367,8 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       saved.url !== draft.url ||
       JSON.stringify(saved.headers) !== JSON.stringify(draft.headers) ||
       JSON.stringify(saved.queryParams) !== JSON.stringify(draft.queryParams) ||
+      JSON.stringify((saved as { pathVariables?: unknown }).pathVariables ?? []) !==
+        JSON.stringify((draft as { pathVariables?: unknown }).pathVariables ?? []) ||
       ((saved as { bodyType?: string }).bodyType ?? '') !== draft.bodyType ||
       JSON.stringify(saved.body) !== JSON.stringify(draft.body) ||
       JSON.stringify(saved.auth) !== JSON.stringify(draft.auth) ||
@@ -375,6 +386,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       url: draft.url,
       headers: draft.headers,
       queryParams: draft.queryParams,
+      pathVariables: (draft as { pathVariables?: unknown }).pathVariables ?? [],
       bodyType: draft.bodyType,
       body: draft.body,
       auth: draft.auth,
@@ -400,7 +412,16 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
     const draftAuth = draft.auth as { type?: string } | undefined;
     if (draftAuth?.type === 'oauth2') {
       try {
-        const r = (await voltApi['oauth:ensureToken'](draft.auth as never)) as {
+        // Substitute {{vars}} in every string field of the OAuth config
+        // (tokenUrl, clientId, clientSecret, scope, …) before the token call.
+        const sendVars = buildVariableMap(globals, env, collectionChain as ScopeCollection[]);
+        const oauthCfg = Object.fromEntries(
+          Object.entries(draft.auth as Record<string, unknown>).map(([k, v]) => [
+            k,
+            typeof v === 'string' ? substituteVariables(v, sendVars) : v,
+          ]),
+        );
+        const r = (await voltApi['oauth:ensureToken'](oauthCfg as never)) as {
           ok: boolean;
           accessToken?: string;
           tokenType?: string;
@@ -427,10 +448,18 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
     }
 
     // Resolve client-side using globals (lowest priority) + env + collections.
-    const { resolved, variables } = resolveLocally(draft, env, collectionChain, globals ?? {});
-    if (oauthHeader) {
-      resolved.headers[oauthHeader.key] = oauthHeader.value;
+    const { resolved, variables, unresolvedUrlVar } = resolveLocally(draft, env, collectionChain, globals ?? {});
+    // A pre-request script may define the variable itself, so only fail early
+    // when there is no script that could still fill it in.
+    if (unresolvedUrlVar && !(draft.preRequestScript ?? '').trim()) {
+      onResponse(buildUnresolvedVarError(unresolvedUrlVar));
+      setSending(false);
+      return;
     }
+    if (oauthHeader) {
+      setHeaderCI(resolved.headers, oauthHeader.key, oauthHeader.value);
+    }
+    applySendSettings(resolved, sendSettings);
 
     const id = rowId('send');
     sendIdRef.current = id;
@@ -439,6 +468,8 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
     try {
       const response = await voltApi['request:send']({
         inFlightId: id,
+        requestId,
+        requestName: draft.name ?? '',
         request: resolved as never,
         preRequestScript: (draft as { preRequestScript?: string }).preRequestScript ?? '',
         postResponseScript: (draft as { postResponseScript?: string }).postResponseScript ?? '',
@@ -458,7 +489,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       qc.invalidateQueries({ queryKey: ['environments', workspaceId] });
       qc.invalidateQueries({ queryKey: ['globals'] });
     }
-  }, [draft, environments, activeEnv, saved, collections, globals, requestId, workspaceId, setInFlight, onResponse, qc]);
+  }, [draft, environments, activeEnv, saved, collections, globals, requestId, workspaceId, setInFlight, onResponse, qc, sendSettings]);
 
   // Open the CodeGen modal with a snapshot of the currently-resolved request
   // (URL with vars substituted, headers as a flat record, body in resolved
@@ -490,12 +521,13 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       const collectionChain = saved?.collectionId
         ? collectColChain(saved.collectionId, collections ?? [])
         : [];
-      const { resolved, variables } = resolveLocally(
+      const { resolved, variables, unresolvedUrlVar } = resolveLocally(
         {
           method: ex.request.method,
           url: ex.request.url,
           headers: ex.request.headers as never,
           queryParams: ex.request.queryParams as never,
+          pathVariables: ex.request.pathVariables ?? [],
           bodyType: ex.request.bodyType,
           body: ex.request.body,
           auth: ex.request.auth,
@@ -504,6 +536,12 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         collectionChain,
         globals ?? {},
       );
+      const exPreScript = ex.request.preRequestScript ?? draft?.preRequestScript ?? '';
+      if (unresolvedUrlVar && !exPreScript.trim()) {
+        onResponse(buildUnresolvedVarError(unresolvedUrlVar));
+        return;
+      }
+      applySendSettings(resolved, sendSettings);
       const id = rowId('send');
       sendIdRef.current = id;
       setInFlight(requestId, id);
@@ -511,6 +549,8 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       try {
         const response = await voltApi['request:send']({
           inFlightId: id,
+          requestId,
+          requestName: draft?.name ?? ex.name,
           request: resolved as never,
           // Prefer the example's snapshot scripts so re-runs reproduce the
           // captured behavior. Older examples without snapshot scripts fall
@@ -530,7 +570,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         sendIdRef.current = null;
       }
     },
-    [draft, environments, activeEnv, saved, collections, globals, requestId, workspaceId, setInFlight, onResponse],
+    [draft, environments, activeEnv, saved, collections, globals, requestId, workspaceId, setInFlight, onResponse, sendSettings],
   );
 
   const cancel = useCallback(() => {
@@ -582,6 +622,37 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
       }}
     >
     <div className="flex h-full flex-col">
+      {remoteChange && remoteChange.requestId === requestId && (
+        <div className="flex items-center justify-between gap-2 border-b border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-xs text-text">
+          <span className="truncate">
+            A teammate changed this request while you have unsaved edits.
+          </span>
+          <div className="flex flex-shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              className="rounded px-2 py-0.5 font-medium hover:bg-amber-500/20"
+              onClick={() => {
+                setDraft(requestId, remoteChange.next as never);
+                draftBaselines.set(requestId, JSON.stringify(remoteChange.next));
+                setRemoteChange(null);
+              }}
+            >
+              Load their version
+            </button>
+            <button
+              type="button"
+              className="rounded px-2 py-0.5 hover:bg-amber-500/20"
+              onClick={() => {
+                // Keep my edits; Save will intentionally overwrite theirs.
+                draftBaselines.set(requestId, JSON.stringify(remoteChange.next));
+                setRemoteChange(null);
+              }}
+            >
+              Keep mine
+            </button>
+          </div>
+        </div>
+      )}
       {/* Example-mode banner. Sits above the name so it's the first thing
           users notice — makes it clear that edits don't touch the live request. */}
       {isExampleMode && (
@@ -625,7 +696,14 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
         />
         <HighlightedInput
           value={activeRequest.url}
-          onChange={(e) => patchActive({ url: e.target.value })}
+          onChange={(e) => {
+            const url = e.target.value;
+            // Keep the Params table in step with the query string typed here.
+            patchActive({
+              url,
+              queryParams: syncParamsFromUrl(url, activeRequest.queryParams as QpRow[]) as never,
+            });
+          }}
           placeholder="https://api.example.com/endpoint"
           className="flex-1"
         />
@@ -698,14 +776,31 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
               <span className="ml-1 text-[10px] text-accent">●</span>
             )}
           </TabsTrigger>
+          <TabsTrigger value="settings">
+            Settings
+            {(!sendSettings.verifyTls || !sendSettings.followRedirects) && (
+              <span className="ml-1 text-[10px] text-warning">●</span>
+            )}
+          </TabsTrigger>
         </TabsList>
 
         <TabsContent value="params" className="overflow-y-auto">
           <KeyValueEditor
             rows={activeRequest.queryParams as never}
-            onChange={(rows) => patchActive({ queryParams: rows as never })}
+            onChange={(rows) =>
+              // Rows are the source of truth; rewrite the URL's query from them.
+              patchActive({
+                queryParams: rows as never,
+                url: buildUrlFromParams(activeRequest.url, rows as QpRow[]),
+              })
+            }
             keyPlaceholder="Param"
             valuePlaceholder="Value"
+          />
+          <PathVariablesTable
+            url={activeRequest.url}
+            rows={activeRequest.pathVariables}
+            onChange={(rows) => patchActive({ pathVariables: rows as never })}
           />
         </TabsContent>
 
@@ -763,6 +858,10 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
             </div>
           </div>
         </TabsContent>
+
+        <TabsContent value="settings" className="overflow-y-auto p-3">
+          <SendSettingsTab settings={sendSettings} onChange={patchSendSettings} />
+        </TabsContent>
       </Tabs>
     </div>
     </VariablesProvider>
@@ -770,10 +869,130 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
 }
 
 // ─────────────────────────────────────────────────────────
+// Send settings (Postman "Settings": redirects, TLS verification, timeout)
+// ─────────────────────────────────────────────────────────
+
+interface SendSettings {
+  followRedirects: boolean;
+  verifyTls: boolean;
+  /** 0 = no timeout. */
+  timeoutMs: number;
+}
+
+const SEND_SETTINGS_KEY = 'volt.sendSettings';
+const DEFAULT_SEND_SETTINGS: SendSettings = { followRedirects: true, verifyTls: true, timeoutMs: 60_000 };
+
+export function loadSendSettings(): SendSettings {
+  try {
+    const raw = localStorage.getItem(SEND_SETTINGS_KEY);
+    if (!raw) return DEFAULT_SEND_SETTINGS;
+    const parsed = JSON.parse(raw) as Partial<SendSettings>;
+    return {
+      followRedirects: parsed.followRedirects ?? DEFAULT_SEND_SETTINGS.followRedirects,
+      verifyTls: parsed.verifyTls ?? DEFAULT_SEND_SETTINGS.verifyTls,
+      timeoutMs:
+        typeof parsed.timeoutMs === 'number' && Number.isFinite(parsed.timeoutMs) && parsed.timeoutMs >= 0
+          ? Math.floor(parsed.timeoutMs)
+          : DEFAULT_SEND_SETTINGS.timeoutMs,
+    };
+  } catch {
+    return DEFAULT_SEND_SETTINGS;
+  }
+}
+
+/**
+ * App-wide send settings, persisted in localStorage (they're per-machine
+ * preferences, like Postman's, not part of the synced request definition).
+ */
+function useSendSettings(): [SendSettings, (patch: Partial<SendSettings>) => void] {
+  const [settings, setSettings] = useState<SendSettings>(loadSendSettings);
+  const patch = useCallback((p: Partial<SendSettings>) => {
+    setSettings((cur) => {
+      const next = { ...cur, ...p };
+      try {
+        localStorage.setItem(SEND_SETTINGS_KEY, JSON.stringify(next));
+      } catch {
+        /* storage unavailable — keep in-memory value */
+      }
+      return next;
+    });
+  }, []);
+  return [settings, patch];
+}
+
+export function applySendSettings(
+  resolved: { timeoutMs: number; followRedirects: boolean; ignoreTlsErrors: boolean },
+  s: SendSettings,
+) {
+  resolved.timeoutMs = s.timeoutMs;
+  resolved.followRedirects = s.followRedirects;
+  resolved.ignoreTlsErrors = !s.verifyTls;
+}
+
+function SendSettingsTab({
+  settings,
+  onChange,
+}: {
+  settings: SendSettings;
+  onChange: (patch: Partial<SendSettings>) => void;
+}) {
+  return (
+    <div className="flex max-w-md flex-col gap-3 text-xs">
+      <label className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          checked={settings.followRedirects}
+          onChange={(e) => onChange({ followRedirects: e.target.checked })}
+          className="mt-0.5 h-3 w-3 accent-accent"
+        />
+        <span>
+          <span className="text-text">Automatically follow redirects</span>
+          <span className="block text-[11px] text-text-muted">
+            Off: 3xx responses are shown as-is instead of being followed (up to 10 hops).
+          </span>
+        </span>
+      </label>
+      <label className="flex items-start gap-2">
+        <input
+          type="checkbox"
+          checked={settings.verifyTls}
+          onChange={(e) => onChange({ verifyTls: e.target.checked })}
+          className="mt-0.5 h-3 w-3 accent-accent"
+        />
+        <span>
+          <span className="text-text">Verify TLS certificates</span>
+          <span className="block text-[11px] text-text-muted">
+            Off: accept self-signed and expired certificates (e.g. local dev servers).
+          </span>
+        </span>
+      </label>
+      <label className="flex items-center gap-2">
+        <span className="text-text">Request timeout</span>
+        <input
+          type="number"
+          min={0}
+          step={1000}
+          value={settings.timeoutMs}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (Number.isFinite(n) && n >= 0) onChange({ timeoutMs: Math.floor(n) });
+          }}
+          className="w-28 rounded border border-border bg-bg px-2 py-1 font-mono text-text outline-none focus:border-accent"
+        />
+        <span className="text-text-muted">ms (0 = no timeout)</span>
+      </label>
+      <p className="text-[11px] text-text-muted">
+        These apply to every request sent from this machine and are not synced.
+      </p>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────
 // Local resolution helpers
 // ─────────────────────────────────────────────────────────
 
-function collectColChain(collectionId: string, collections: Array<{ id: string; parentId: string | null; variables?: unknown }>): unknown[] {
+export function collectColChain(collectionId: string, collections: Array<{ id: string; parentId: string | null; variables?: unknown }>): unknown[] {
   const chain: typeof collections = [];
   let cur = collections.find((c) => c.id === collectionId);
   while (cur) {
@@ -783,41 +1002,48 @@ function collectColChain(collectionId: string, collections: Array<{ id: string; 
   return chain;
 }
 
+/** Set a header, replacing any existing one with the same name in any casing. */
+export function setHeaderCI(headers: Record<string, string>, name: string, value: string) {
+  const lower = name.toLowerCase();
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === lower) delete headers[k];
+  }
+  headers[name] = value;
+}
+
+/** UTF-8-safe base64 — plain btoa() throws on any non-Latin1 character. */
+function utf8ToBase64(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin);
+}
+
 /**
  * Client-side resolution — handles {{var}} substitution from environment +
  * collection chain. Secret refs are not resolved here (they go via IPC to
  * keytar in main process); we send them as-is for now and rely on main
  * process to substitute. For MVP we just do simple env merging.
  */
-function resolveLocally(
+export function resolveLocally(
   draft: {
     method: string;
     url: string;
     headers: unknown;
     queryParams: unknown;
+    pathVariables?: unknown;
     bodyType: string;
     body: unknown;
     auth: unknown;
   },
-  env: { variables?: Array<{ key: string; value: string }> } | null,
+  env: { id: string; name: string; variables?: Array<{ key: string; value: string }> } | null,
   collections: unknown[],
   globals: Record<string, unknown> = {},
 ) {
-  const vars = new Map<string, string>();
-  // Precedence (lowest first; later overrides earlier):
-  //   1. Globals (set by scripts)
-  //   2. Active environment
-  //   3. Collection chain root → deepest (deeper overrides)
-  for (const [k, v] of Object.entries(globals)) {
-    if (v != null) vars.set(k, typeof v === 'string' ? v : JSON.stringify(v));
-  }
-  if (env?.variables) for (const v of env.variables) vars.set(v.key, v.value);
-  for (const c of [...collections].reverse() as Array<{ variables?: Array<{ key: string; value: string }> }>) {
-    if (c.variables) for (const v of c.variables) vars.set(v.key, v.value);
-  }
-
-  const subst = (s: string) =>
-    s.replace(/\{\{\s*([\w.-]+)\s*\}\}/g, (_, name) => vars.get(name) ?? '');
+  // Precedence (Postman): env > collection chain (deepest first) > globals.
+  // Disabled rows are skipped; {{$guid}} / {{$timestamp}} / … are generated.
+  const vars = buildVariableMap(globals, env, collections as ScopeCollection[]);
+  const subst = (s: string) => substituteVariables(s, vars);
 
   // Headers (filter disabled + subst)
   const headers: Record<string, string> = {};
@@ -826,34 +1052,47 @@ function resolveLocally(
     if (h.key) headers[subst(h.key)] = subst(h.value);
   }
 
-  // URL + query params
-  let url = subst(draft.url);
-  const qp = (draft.queryParams as Array<{ key: string; value: string; enabled?: boolean }>) ?? [];
-  const enabledQp = qp.filter((q) => q.enabled !== false && q.key);
+  // URL. The Params table is the source of truth for the query string (the
+  // URL bar and the table are kept in sync while editing); pairs that exist
+  // only in the raw URL (examples / rows saved before the sync landed) are
+  // merged in rather than appended, so nothing is sent twice. Path segments
+  // like `/users/:id` are filled from the Path Variables table. Unresolved
+  // `{{name}}` placeholders in the URL are reported to the caller.
+  const unresolvedInUrl = new Set<string>();
+  const substUrl = (s: string) => substituteVariables(s, vars, unresolvedInUrl);
+  const qpRows = mergeUrlQueryIntoRows(draft.url, (draft.queryParams as QpRow[]) ?? []);
+  let url = substUrl(
+    applyPathVariables(splitUrl(draft.url).base, (draft.pathVariables as QpRow[]) ?? [], substUrl),
+  );
+  const enabledQp = qpRows.filter((q) => q.enabled !== false && (q.key || q.value));
   if (enabledQp.length > 0) {
-    const sep = url.includes('?') ? '&' : '?';
     url +=
-      sep +
+      '?' +
       enabledQp
-        .map((q) => `${encodeURIComponent(subst(q.key))}=${encodeURIComponent(subst(q.value))}`)
+        .map((q) => `${encodeQueryComponent(substUrl(q.key))}=${encodeQueryComponent(substUrl(q.value))}`)
         .join('&');
   }
+  const unresolvedUrlVar: string | null = unresolvedInUrl.size > 0 ? [...unresolvedInUrl][0]! : null;
 
   // Auth
   const auth = draft.auth as { type: string; [k: string]: unknown };
+  // Auth helper wins over a manually typed header with the same name (any
+  // casing) — otherwise the request goes out with two Authorization headers.
   if (auth.type === 'bearer' && (auth.token as string)) {
-    headers['Authorization'] = `Bearer ${subst(auth.token as string)}`;
+    setHeaderCI(headers, 'Authorization', `Bearer ${subst(auth.token as string)}`);
   } else if (auth.type === 'basic') {
-    const encoded = btoa(`${subst((auth.username as string) ?? '')}:${subst((auth.password as string) ?? '')}`);
-    headers['Authorization'] = `Basic ${encoded}`;
+    const encoded = utf8ToBase64(
+      `${subst((auth.username as string) ?? '')}:${subst((auth.password as string) ?? '')}`,
+    );
+    setHeaderCI(headers, 'Authorization', `Basic ${encoded}`);
   } else if (auth.type === 'apiKey') {
     const k = subst((auth.key as string) ?? '');
     const v = subst((auth.value as string) ?? '');
     if (k) {
       if (auth.placement === 'query') {
-        url += (url.includes('?') ? '&' : '?') + `${encodeURIComponent(k)}=${encodeURIComponent(v)}`;
+        url += (url.includes('?') ? '&' : '?') + `${encodeQueryComponent(k)}=${encodeQueryComponent(v)}`;
       } else {
-        headers[k] = v;
+        setHeaderCI(headers, k, v);
       }
     }
   }
@@ -915,7 +1154,181 @@ function resolveLocally(
       followRedirects: true,
       ignoreTlsErrors: false,
     },
-    variables: Object.fromEntries(vars),
+    variables: Object.fromEntries(Array.from(vars, ([k, v]) => [k, v.value])),
+    unresolvedUrlVar,
+  };
+}
+
+// ─────────────────────────────────────────────────────────
+// URL ↔ Params sync + path variables
+// ─────────────────────────────────────────────────────────
+
+type QpRow = { id: string; key: string; value: string; enabled?: boolean; description?: string };
+
+/** Split a raw (unsubstituted) URL into base, query (without `?`) and hash. */
+function splitUrl(url: string): { base: string; query: string | null; hash: string } {
+  const hashIdx = url.indexOf('#');
+  const hash = hashIdx >= 0 ? url.slice(hashIdx) : '';
+  const noHash = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
+  const qIdx = noHash.indexOf('?');
+  if (qIdx < 0) return { base: noHash, query: null, hash };
+  return { base: noHash.slice(0, qIdx), query: noHash.slice(qIdx + 1), hash };
+}
+
+/** `a=1&b&c=` → [['a','1'],['b',''],['c','']]. Raw text, no decoding, so `{{var}}` survives. */
+function parseQueryPairs(query: string | null): Array<[string, string]> {
+  if (!query) return [];
+  return query
+    .split('&')
+    .filter((p) => p.length > 0)
+    .map((p) => {
+      const eq = p.indexOf('=');
+      return eq < 0 ? [p, ''] : [p.slice(0, eq), p.slice(eq + 1)];
+    });
+}
+
+/**
+ * URL bar → Params table. The query string typed in the URL replaces the
+ * enabled rows (matched by position so row ids, and thus focus, stay stable
+ * while typing); disabled rows aren't part of the URL and are kept.
+ */
+function syncParamsFromUrl(url: string, rows: QpRow[]): QpRow[] {
+  const pairs = parseQueryPairs(splitUrl(url).query);
+  const enabled = rows.filter((r) => r.enabled !== false);
+  const disabled = rows.filter((r) => r.enabled === false);
+  const next: QpRow[] = pairs.map(([key, value], i) => {
+    const existing = enabled[i];
+    return existing
+      ? { ...existing, key, value, enabled: true }
+      : { id: rowId('kv'), key, value, enabled: true };
+  });
+  return [...next, ...disabled];
+}
+
+/** Params table → URL bar. Enabled rows become the query; the base + hash are kept. */
+export function buildUrlFromParams(url: string, rows: QpRow[]): string {
+  const { base, hash } = splitUrl(url);
+  const pairs = rows
+    .filter((r) => r.enabled !== false && (r.key || r.value))
+    .map((r) => (r.value ? `${r.key}=${r.value}` : r.key));
+  return base + (pairs.length > 0 ? `?${pairs.join('&')}` : '') + hash;
+}
+
+/**
+ * Union of the table rows and any pairs present only in the URL's query
+ * (older saved requests / examples where only the URL was edited). Used
+ * when loading a draft and at send time so nothing is lost or sent twice.
+ */
+export function mergeUrlQueryIntoRows(url: string, rows: QpRow[]): QpRow[] {
+  const pairs = parseQueryPairs(splitUrl(url).query);
+  if (pairs.length === 0) return rows;
+  const enabled = rows.filter((r) => r.enabled !== false);
+  const extra: QpRow[] = [];
+  for (const [key, value] of pairs) {
+    const present =
+      enabled.some((r) => r.key === key && r.value === value) ||
+      extra.some((r) => r.key === key && r.value === value);
+    if (!present) extra.push({ id: rowId('kv'), key, value, enabled: true });
+  }
+  return extra.length > 0 ? [...rows, ...extra] : rows;
+}
+
+// `/:name` path segments (host:port is never matched because we only look at
+// the part after the authority).
+const PATH_VAR_RE = /\/:([A-Za-z_][\w.-]*)(?=\/|$)/g;
+
+/** Index where the path begins in a raw URL base (after scheme + authority), or -1. */
+function pathStart(base: string): number {
+  const schemeIdx = base.indexOf('://');
+  return schemeIdx >= 0 ? base.indexOf('/', schemeIdx + 3) : base.indexOf('/');
+}
+
+/** Ordered, de-duplicated `:name` keys in the URL path. */
+function derivePathVarKeys(url: string): string[] {
+  const base = splitUrl(url).base;
+  const start = pathStart(base);
+  if (start < 0) return [];
+  const keys: string[] = [];
+  for (const m of base.slice(start).matchAll(PATH_VAR_RE)) {
+    const k = m[1]!;
+    if (!keys.includes(k)) keys.push(k);
+  }
+  return keys;
+}
+
+/** Replace `/:name` segments with the (substituted) value from the table; empty values are left as-is. */
+function applyPathVariables(base: string, rows: QpRow[], subst: (s: string) => string): string {
+  const start = pathStart(base);
+  if (start < 0 || rows.length === 0) return base;
+  const head = base.slice(0, start);
+  const path = base.slice(start).replace(PATH_VAR_RE, (match, name: string) => {
+    const row = rows.find((r) => r.key === name && r.enabled !== false);
+    const value = row ? subst(row.value) : '';
+    return value ? `/${value}` : match;
+  });
+  return head + path;
+}
+
+/**
+ * Postman-style Path Variables table: keys are derived from `:name` segments
+ * in the URL (read-only); only the values are editable. Hidden when the URL
+ * has no path variables.
+ */
+function PathVariablesTable({
+  url,
+  rows,
+  onChange,
+}: {
+  url: string;
+  rows: QpRow[];
+  onChange: (rows: QpRow[]) => void;
+}) {
+  const keys = useMemo(() => derivePathVarKeys(url), [url]);
+  if (keys.length === 0) return null;
+  // Rows shown = current keys, carrying over any value already stored.
+  const shown: QpRow[] = keys.map(
+    (k) => rows.find((r) => r.key === k) ?? { id: `pv-${k}`, key: k, value: '', enabled: true },
+  );
+  const setValue = (key: string, value: string) =>
+    onChange(shown.map((r) => (r.key === key ? { ...r, value } : r)));
+  return (
+    <div className="border-t border-border">
+      <div className="bg-bg-elevated px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+        Path variables
+      </div>
+      {shown.map((row) => (
+        <div key={row.key} className="flex items-center gap-1 border-b border-border/40 px-1 py-0.5">
+          <span className="w-5" />
+          <span className="flex-1 truncate px-2 font-mono text-xs text-text-muted" title={`:${row.key}`}>
+            {row.key}
+          </span>
+          <HighlightedInput
+            flat
+            value={row.value}
+            onChange={(e) => setValue(row.key, e.target.value)}
+            placeholder="Value"
+            className="flex-1"
+          />
+          <span className="w-6" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function buildUnresolvedVarError(name: string) {
+  return {
+    ok: false as const,
+    errorCode: 'UNRESOLVED_VARIABLE',
+    errorMessage: `Unresolved variable {{${name}}} in URL. Select an environment or define it.`,
+    timing: {
+      dnsMs: null,
+      tcpMs: null,
+      tlsMs: null,
+      ttfbMs: null,
+      downloadMs: null,
+      totalMs: 0,
+    },
   };
 }
 
@@ -928,6 +1341,7 @@ interface ExampleRow {
     url: string;
     headers: Array<{ key: string; value: string }>;
     queryParams: Array<{ key: string; value: string }>;
+    pathVariables?: QpRow[];
     bodyType: string;
     body: unknown;
     auth: unknown;
@@ -976,28 +1390,51 @@ function ScriptsHelp() {
         Available API
         <span className="ml-2 text-text-muted">(click to expand)</span>
       </summary>
+      <p className="mt-2">
+        Scripts use the Postman <code>pm</code> API, so snippets from Postman docs work as-is.{' '}
+        <code>volt</code> is an alias for <code>pm</code>.
+      </p>
       <div className="mt-2 space-y-1 font-mono">
-        <p><code>volt.globals.get(key)</code> / <code>set(key, value)</code> / <code>unset(key)</code> / <code>has(key)</code> / <code>all()</code></p>
-        <p><code>volt.environment.get(key)</code> / <code>set(key, value)</code> / <code>unset(key)</code> / <code>has(key)</code> / <code>all()</code> / <code>.name</code></p>
-        <p><code>volt.variables.get(key)</code> — read the merged env + collection + globals map</p>
-        <p><code>volt.request</code> — pre-request: mutate <code>.url</code>, <code>.headers</code>, <code>.body</code>, etc.</p>
-        <p><code>volt.response</code> — post-response: <code>.status</code>, <code>.headers</code>, <code>.text</code>, <code>.json</code></p>
-        <p><code>console.log(...)</code> — output appears in the response panel</p>
+        <p><code>pm.test(name, fn)</code> — register a test; results show in the Tests tab. <code>pm.test.skip(name, fn)</code> to skip.</p>
+        <p><code>pm.expect(value)</code> — Chai-style assertions: <code>.to.equal()</code>, <code>.to.eql()</code>, <code>.to.be.true</code>, <code>.to.have.property()</code>, <code>.to.include()</code>, <code>.to.be.a()</code>…</p>
+        <p><code>pm.response</code> — post-response: <code>.code</code>, <code>.status</code>, <code>.headers.get(name)</code>, <code>.text()</code>, <code>.json()</code>, <code>.responseTime</code>, <code>.to.have.status(200)</code>, <code>.to.be.ok</code></p>
+        <p><code>pm.request</code> — <code>.url</code>, <code>.method</code>, <code>.headers</code>, <code>.body</code> (mutable in pre-request)</p>
+        <p><code>pm.environment.get(key)</code> / <code>set(key, value)</code> / <code>unset(key)</code> / <code>has(key)</code> / <code>toObject()</code> / <code>.name</code></p>
+        <p><code>pm.globals.get(key)</code> / <code>set(key, value)</code> / <code>unset(key)</code> / <code>has(key)</code> / <code>toObject()</code></p>
+        <p><code>pm.variables.get(key)</code> / <code>set(key, value)</code> — merged globals + env + collection map (set = this run only); <code>pm.variables.replaceIn(str)</code></p>
+        <p><code>pm.collectionVariables</code> — same shape, scoped to the collection</p>
+        <p><code>pm.sendRequest(urlOrOptions, (err, res) =&gt; …)</code> — fire a side request (also returns a Promise)</p>
+        <p><code>pm.info</code> — <code>.eventName</code> (<code>prerequest</code> / <code>test</code>), <code>.requestName</code>, <code>.requestId</code></p>
+        <p><code>console.log(...)</code> — output appears above the response body and in the Tests tab</p>
       </div>
       <div className="mt-2 font-mono">
         <p className="text-text">Example (post-response):</p>
         <pre className="mt-1 rounded bg-bg p-2 text-text-muted">
-{`const data = volt.response.json;
+{`pm.test('status is 200', () => pm.response.to.have.status(200));
+
+const data = pm.response.json();
+pm.test('has a token', () => {
+  pm.expect(data).to.have.property('token');
+});
 if (data?.token) {
-  // either persist to globals (per-device)
-  volt.globals.set('authToken', data.token);
-  // or write through to the active environment (synced to backend)
-  volt.environment.set('authToken', data.token);
+  // persist for later requests: globals (per-device)…
+  pm.globals.set('authToken', data.token);
+  // …or the active environment (synced to the backend)
+  pm.environment.set('authToken', data.token);
 }`}
         </pre>
       </div>
     </details>
   );
+}
+
+/**
+ * Percent-encode a query key/value like Postman: everything that needs
+ * encoding is encoded, but a value the user already encoded (`a%20b`,
+ * `%7Bid%7D`) is left alone instead of being double-encoded to `%2520`.
+ */
+function encodeQueryComponent(s: string): string {
+  return encodeURIComponent(s).replace(/%25([0-9A-Fa-f]{2})/g, '%$1');
 }
 
 function rawLanguageContentType(lang: string | undefined): string | null {

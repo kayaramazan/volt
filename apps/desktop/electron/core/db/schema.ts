@@ -107,6 +107,7 @@ export const apiRequests = sqliteTable(
     // All shape-variable fields stored as JSON to avoid migration churn.
     headers: text('headers').notNull().default('[]'),      // HeaderRow[]
     queryParams: text('query_params').notNull().default('[]'),
+    pathVariables: text('path_variables').notNull().default('[]'),
     bodyType: text('body_type').notNull().default('none'),
     body: text('body').notNull().default('{}'),            // RequestBody
     auth: text('auth').notNull().default('{"type":"none"}'),

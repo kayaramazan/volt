@@ -14,6 +14,15 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { voltApi } from '@/lib/volt-api';
+import { toast } from '@/stores/toasts';
+import { useSelection } from '@/stores/selection';
+import { useDrafts } from '@/stores/drafts';
+
+/** Shared onError for mutations: surface the failure instead of swallowing it. */
+const reportError = (title: string) => (err: unknown) => {
+  console.error(`${title}:`, err);
+  toast.error(title, err);
+};
 
 // ─────────────────────────────────────────────────────────
 // Workspaces
@@ -32,6 +41,7 @@ export function useCreateWorkspace() {
     mutationFn: (input: { name: string; teamId?: string }) =>
       voltApi['workspace:create'](input),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['workspaces'] }),
+    onError: reportError('Could not create workspace'),
   });
 }
 
@@ -40,6 +50,7 @@ export function useRenameWorkspace() {
   return useMutation({
     mutationFn: (input: { id: string; name: string }) => voltApi['workspace:rename'](input),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['workspaces'] }),
+    onError: reportError('Could not rename workspace'),
   });
 }
 
@@ -47,7 +58,16 @@ export function useDeleteWorkspace() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => voltApi['workspace:delete']({ id }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['workspaces'] }),
+    onSuccess: (_d, id) => {
+      // App's auto-select effect moves the selection once the list refetches;
+      // drop the dead workspace's cached children so nothing stale flashes.
+      qc.removeQueries({ queryKey: ['collections', id] });
+      qc.removeQueries({ queryKey: ['requests', id] });
+      qc.removeQueries({ queryKey: ['environments', id] });
+      qc.removeQueries({ queryKey: ['history', id] });
+      qc.invalidateQueries({ queryKey: ['workspaces'] });
+    },
+    onError: reportError('Could not delete workspace'),
   });
 }
 
@@ -71,6 +91,23 @@ export function useCreateCollection() {
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['collections', vars.workspaceId] });
     },
+    onError: reportError('Could not create collection'),
+  });
+}
+
+/**
+ * Deep-copy a collection (sub-folders + requests + examples) next to the
+ * original. Main does the copy in one transaction.
+ */
+export function useDuplicateCollection() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => voltApi['collection:duplicate']({ id }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['collections'] });
+      qc.invalidateQueries({ queryKey: ['requests'] });
+    },
+    onError: reportError('Could not duplicate collection'),
   });
 }
 
@@ -91,6 +128,7 @@ export function useUpdateCollection() {
       // Mock list may have changed — refresh the status pill too.
       qc.invalidateQueries({ queryKey: ['mock-status'] });
     },
+    onError: reportError('Could not update collection'),
   });
 }
 
@@ -99,9 +137,12 @@ export function useDeleteCollection() {
   return useMutation({
     mutationFn: (id: string) => voltApi['collection:delete']({ id }),
     onSuccess: () => {
+      // Requests inside the deleted tree are gone too; Workspace prunes any
+      // open tabs for them once the list refetches.
       qc.invalidateQueries({ queryKey: ['collections'] });
       qc.invalidateQueries({ queryKey: ['requests'] });
     },
+    onError: reportError('Could not delete collection'),
   });
 }
 
@@ -139,6 +180,7 @@ export function useCreateRequest() {
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['requests', vars.workspaceId] });
     },
+    onError: reportError('Could not create request'),
   });
 }
 
@@ -147,10 +189,14 @@ export function useUpdateRequest() {
   return useMutation({
     mutationFn: (input: { id: string; [k: string]: unknown }) =>
       voltApi['apiRequest:update'](input as never),
-    onSuccess: (_data, vars) => {
+    onSuccess: (data, vars) => {
+      // Seed the detail cache with the returned row so the editor's dirty
+      // check and the tab strip's • clear immediately, then refetch lists.
+      if (data) qc.setQueryData(['request', vars.id], data);
       qc.invalidateQueries({ queryKey: ['request', vars.id] });
       qc.invalidateQueries({ queryKey: ['requests'] });
     },
+    onError: reportError('Could not save request'),
   });
 }
 
@@ -189,6 +235,7 @@ export function useDuplicateRequest() {
       } as never);
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ['requests'] }),
+    onError: reportError('Could not duplicate request'),
   });
 }
 
@@ -196,7 +243,15 @@ export function useDeleteRequest() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => voltApi['apiRequest:delete']({ id }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['requests'] }),
+    onSuccess: (_d, id) => {
+      // Close its tab right away (no unsaved-changes prompt — the row is gone)
+      // and drop draft/response state so the id can't resurface.
+      useDrafts.getState().forgetRequest(id);
+      useSelection.getState().closeTab(id);
+      qc.removeQueries({ queryKey: ['request', id] });
+      qc.invalidateQueries({ queryKey: ['requests'] });
+    },
+    onError: reportError('Could not delete request'),
   });
 }
 
@@ -218,6 +273,7 @@ export function useCreateEnvironment() {
     mutationFn: (input: { workspaceId: string; name: string }) =>
       voltApi['env:create'](input),
     onSuccess: (_d, vars) => qc.invalidateQueries({ queryKey: ['environments', vars.workspaceId] }),
+    onError: reportError('Could not create environment'),
   });
 }
 
@@ -227,6 +283,7 @@ export function useUpdateEnvironment() {
     mutationFn: (input: { id: string; name?: string; variables?: unknown }) =>
       voltApi['env:update'](input as never),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['environments'] }),
+    onError: reportError('Could not save environment'),
   });
 }
 
@@ -235,6 +292,7 @@ export function useDeleteEnvironment() {
   return useMutation({
     mutationFn: (id: string) => voltApi['env:delete']({ id }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['environments'] }),
+    onError: reportError('Could not delete environment'),
   });
 }
 
@@ -293,6 +351,17 @@ export function useHistoryEntry(id: string | null) {
     queryKey: ['history-entry', id],
     queryFn: () => voltApi['history:get']({ id: id! }),
     enabled: !!id,
+  });
+}
+
+export function useClearHistory() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (workspaceId: string) => voltApi['history:clear']({ workspaceId }),
+    onSuccess: (_d, workspaceId) => {
+      qc.invalidateQueries({ queryKey: ['history', workspaceId] });
+    },
+    onError: reportError('Could not clear history'),
   });
 }
 
@@ -556,5 +625,27 @@ export function useAcceptInvite() {
       qc.invalidateQueries({ queryKey: ['teams'] });
       qc.invalidateQueries({ queryKey: ['workspaces'] });
     },
+  });
+}
+
+// ─── Desktop widget favourites (macOS "Volt Quick Run") ───
+
+export function useWidgetFavorites() {
+  return useQuery({
+    queryKey: ['widget-favorites'],
+    queryFn: () => voltApi['widget:favorites']({}) as Promise<{ requestIds: string[]; supported: boolean }>,
+    staleTime: Infinity,
+  });
+}
+
+export function useSetWidgetFavorite() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (input: { requestId: string; favorite: boolean }) => voltApi['widget:setFavorite'](input),
+    onSuccess: (_r, input) => {
+      qc.invalidateQueries({ queryKey: ['widget-favorites'] });
+      toast.success(input.favorite ? 'Added to widget' : 'Removed from widget');
+    },
+    onError: (err) => toast.error('Could not update widget', err),
   });
 }

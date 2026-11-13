@@ -10,6 +10,7 @@ import { html } from '@codemirror/lang-html';
 import { cn } from '@/lib/util';
 import { voltVarHighlight } from '@/lib/var-highlight';
 import { VarEditor } from '@/components/ui/VarEditor';
+import { useEffectiveTheme } from '@/stores/theme';
 
 type Language = 'json' | 'xml' | 'javascript' | 'html' | 'text';
 
@@ -53,6 +54,7 @@ export function CodeEditor({
   placeholder,
   enableVarEditor = true,
 }: Props) {
+  const editorTheme = useEffectiveTheme();
   const [popup, setPopup] = useState<VarPopup | null>(null);
   const closeTimerRef = useRef<number | null>(null);
   const popupHasFocusRef = useRef(false);
@@ -104,7 +106,7 @@ export function CodeEditor({
             const varEl = target?.closest?.('.cm-volt-var') as HTMLElement | null;
             if (!varEl) return false;
             const raw = varEl.textContent ?? '';
-            const m = /\{\{\s*([\w.-]+)\s*\}\}/.exec(raw);
+            const m = /\{\{\s*(\$?[\w.-]+)\s*\}\}/.exec(raw);
             const name = m?.[1] ?? '';
             if (!name) return false;
             // Cancel any pending close from a prior mouseout.
@@ -141,7 +143,7 @@ export function CodeEditor({
         extensions={extensions as never}
         readOnly={readOnly}
         placeholder={placeholder}
-        theme="dark"
+        theme={editorTheme}
         basicSetup={{
           lineNumbers: true,
           foldGutter: true,

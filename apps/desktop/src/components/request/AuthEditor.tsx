@@ -153,6 +153,37 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
+// Pending PKCE verifier/state per token cache key. Module-level so switching
+// request tabs (which unmounts this panel) between "Open authorize URL" and
+// "Exchange" doesn't lose the verifier the token endpoint needs.
+const pendingAuthCodeFlows = new Map<string, { verifier: string; state?: string }>();
+
+function errorMessage(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  // IPC wrapper prefixes errors with "Error invoking remote method 'x': Error: "
+  return msg.replace(/^Error invoking remote method '[^']*': (Error: )?/, '');
+}
+
+/**
+ * Users often paste the whole redirect URL (http://localhost/cb?code=…&state=…)
+ * instead of just the code. Accept both. Returns the state too so we can check
+ * it against the one we generated.
+ */
+function parseAuthCodeInput(raw: string): { code: string; state?: string } {
+  const text = raw.trim();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) {
+    try {
+      const u = new URL(text);
+      const code = u.searchParams.get('code') ?? new URLSearchParams(u.hash.replace(/^#/, '')).get('code');
+      const state = u.searchParams.get('state') ?? undefined;
+      if (code) return { code, state };
+    } catch {
+      /* fall through — treat as literal code */
+    }
+  }
+  return { code: text };
+}
+
 function OAuthPanel({
   auth,
   onChange,
@@ -160,7 +191,10 @@ function OAuthPanel({
   auth: Extract<Auth, { type: 'oauth2' }>;
   onChange: (a: Auth) => void;
 }) {
-  const [verifier, setVerifier] = useState<string | null>(null);
+  const flowKey = auth.tokenCacheKey || `${auth.grant}_${auth.clientId}_${auth.tokenUrl}`;
+  const [verifier, setVerifier] = useState<string | null>(
+    () => pendingAuthCodeFlows.get(flowKey)?.verifier ?? null,
+  );
   const [authCode, setAuthCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
@@ -180,6 +214,8 @@ function OAuthPanel({
         setStatus(
           `Token cached${r.expiresAt ? ` (expires ${new Date(r.expiresAt).toLocaleString()})` : ''}.`,
         );
+    } catch (err) {
+      setStatus(`Failed: ${errorMessage(err)}`);
     } finally {
       setBusy(false);
     }
@@ -189,10 +225,17 @@ function OAuthPanel({
     setBusy(true);
     setStatus(null);
     try {
-      const r = (await voltApi['oauth:getAuthUrl'](auth as never)) as { url: string; verifier: string };
+      const r = (await voltApi['oauth:getAuthUrl'](auth as never)) as {
+        url: string;
+        verifier: string;
+        state?: string;
+      };
+      pendingAuthCodeFlows.set(flowKey, { verifier: r.verifier, state: r.state });
       setVerifier(r.verifier);
       await voltApi['app:openExternal']({ url: r.url });
-      setStatus('Browser opened. Paste the returned code below.');
+      setStatus('Browser opened. Paste the returned code (or the full redirect URL) below.');
+    } catch (err) {
+      setStatus(`Failed: ${errorMessage(err)}`);
     } finally {
       setBusy(false);
     }
@@ -200,15 +243,28 @@ function OAuthPanel({
 
   async function exchange() {
     if (!verifier || !authCode.trim()) return;
+    const { code, state } = parseAuthCodeInput(authCode);
+    const expectedState = pendingAuthCodeFlows.get(flowKey)?.state;
+    if (state && expectedState && state !== expectedState) {
+      setStatus('Failed: state mismatch — the redirect does not belong to this authorize attempt. Open the authorize URL again.');
+      return;
+    }
     setBusy(true);
+    setStatus(null);
     try {
       const r = (await voltApi['oauth:exchangeCode']({
         ...(auth as Record<string, unknown>),
-        code: authCode.trim(),
+        code,
         verifier,
       } as never)) as { ok: boolean; error?: string };
       setStatus(r.ok ? 'Token cached.' : `Failed: ${r.error}`);
-      if (r.ok) setAuthCode('');
+      if (r.ok) {
+        setAuthCode('');
+        pendingAuthCodeFlows.delete(flowKey);
+        setVerifier(null);
+      }
+    } catch (err) {
+      setStatus(`Failed: ${errorMessage(err)}`);
     } finally {
       setBusy(false);
     }

@@ -5,14 +5,17 @@ import { useEffect } from 'react';
 
 import { onVoltEvent } from '@/lib/volt-api';
 import { useSelection } from '@/stores/selection';
+import { useTabActions } from '@/hooks/useTabActions';
 
 export function useMenuEvents() {
+  const { closeTab } = useTabActions();
   useEffect(() => {
     return onVoltEvent((event: unknown) => {
       const e = event as { kind?: string };
       if (e?.kind !== 'menu:close-current-tab') return;
-      const { requestId, closeTab } = useSelection.getState();
+      const { requestId } = useSelection.getState();
+      // Same path as the tab's × button: prompts when there are unsaved edits.
       if (requestId) closeTab(requestId);
     });
-  }, []);
+  }, [closeTab]);
 }

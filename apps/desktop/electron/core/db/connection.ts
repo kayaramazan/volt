@@ -108,6 +108,7 @@ function runMigrations(raw: Database.Database) {
       url TEXT NOT NULL,
       headers TEXT NOT NULL DEFAULT '[]',
       query_params TEXT NOT NULL DEFAULT '[]',
+      path_variables TEXT NOT NULL DEFAULT '[]',
       body_type TEXT NOT NULL DEFAULT 'none',
       body TEXT NOT NULL DEFAULT '{}',
       auth TEXT NOT NULL DEFAULT '{"type":"none"}',
@@ -211,6 +212,10 @@ function runMigrations(raw: Database.Database) {
     raw.exec(
       `ALTER TABLE api_requests ADD COLUMN post_response_script TEXT NOT NULL DEFAULT ''`,
     );
+  }
+  // Path variables (`:id` segments) — JSON array of key/value rows.
+  if (!reqHas('path_variables')) {
+    raw.exec(`ALTER TABLE api_requests ADD COLUMN path_variables TEXT NOT NULL DEFAULT '[]'`);
   }
 
   // v4: collection.description (markdown documentation).

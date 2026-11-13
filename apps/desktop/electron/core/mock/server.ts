@@ -24,7 +24,8 @@ interface RuntimeState {
 
 const state: RuntimeState = {
   server: null,
-  port: readStoredPort(),
+  // Real value is read from the DB in bootMockServer(), once the DB is ready.
+  port: DEFAULT_PORT,
   lastError: null,
 };
 
@@ -94,11 +95,14 @@ export async function stopMockServer(): Promise<{ running: false }> {
       resolve({ running: false });
       return;
     }
+    // Detach immediately so a Stop → Start on the same port doesn't race
+    // against lingering keep-alive sockets (close() alone waits for them).
+    state.server = null;
     srv.close(() => {
-      state.server = null;
       broadcastStatus();
       resolve({ running: false });
     });
+    srv.closeAllConnections();
   });
 }
 
@@ -108,6 +112,7 @@ export function setAutostart(on: boolean) {
 
 // Called from main.ts after DB is ready.
 export async function bootMockServer() {
+  state.port = readStoredPort();
   if (getState(STATE_AUTOSTART_KEY) === '1') {
     await startMockServer().catch(() => {
       // Boot failure is non-fatal — the user can retry from the UI.
@@ -144,11 +149,24 @@ function getAllActiveMocks(): MockDefinition[] {
 
 function findMatchingMock(method: string, urlPath: string): MockDefinition | null {
   const upperMethod = method.toUpperCase();
-  for (const m of getAllActiveMocks()) {
-    if (m.method !== '*' && m.method.toUpperCase() !== upperMethod) continue;
+  // Most specific first, so `/users/me` beats `/users/:id` beats `/users/*`
+  // and an exact-method mock beats a `*` one, regardless of list order.
+  const candidates = getAllActiveMocks()
+    .filter((m) => m.method === '*' || m.method.toUpperCase() === upperMethod)
+    .map((m, idx) => ({ m, idx, score: specificity(m) }))
+    .sort((a, b) => b.score - a.score || a.idx - b.idx);
+  for (const { m } of candidates) {
     if (matchPath(m.pathPattern, urlPath)) return m;
   }
   return null;
+}
+
+function specificity(m: MockDefinition): number {
+  const pattern = m.pathPattern ?? '';
+  const params = (pattern.match(/:[A-Za-z_]\w*/g) ?? []).length;
+  const wildcards = (pattern.match(/\*/g) ?? []).length;
+  const literal = pattern.replace(/:[A-Za-z_]\w*/g, '').replace(/\*/g, '').length;
+  return literal * 10 - params * 100 - wildcards * 1000 + (m.method === '*' ? 0 : 1);
 }
 
 /** Converts a route pattern like `/users/:id` or `/api/*` into a regex. */
@@ -164,10 +182,20 @@ function patternToRegex(pattern: string): RegExp {
 
 function matchPath(pattern: string, path: string): boolean {
   try {
-    return patternToRegex(pattern).test(path);
+    // Tolerate a missing leading slash in the pattern and a trailing slash
+    // on either side (`/users` ≡ `/users/`), like Postman's mock router.
+    const p = normalizePath(pattern);
+    return patternToRegex(p).test(normalizePath(path));
   } catch {
     return false;
   }
+}
+
+function normalizePath(p: string): string {
+  let s = p.trim();
+  if (!s.startsWith('/')) s = `/${s}`;
+  if (s.length > 1) s = s.replace(/\/+$/, '');
+  return s;
 }
 
 async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -177,6 +205,17 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
 
   // Always drain the body so the connection cleanly closes.
   await drainRequest(req);
+
+  // Browser callers (a frontend pointed at the mock) need CORS; answer the
+  // preflight ourselves unless the user defined an OPTIONS mock for it.
+  res.setHeader('access-control-allow-origin', req.headers.origin ?? '*');
+  res.setHeader('access-control-allow-headers', req.headers['access-control-request-headers'] ?? '*');
+  res.setHeader('access-control-allow-methods', 'GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS');
+  if (!mock && method.toUpperCase() === 'OPTIONS') {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
 
   if (!mock) {
     res.statusCode = 404;

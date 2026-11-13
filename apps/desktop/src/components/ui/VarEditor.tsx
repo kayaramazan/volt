@@ -5,7 +5,7 @@
 // active environment when the variable is unresolved (creates a new entry).
 
 import { useRef, useState } from 'react';
-import { Save, X, AlertCircle, CheckCircle2 } from 'lucide-react';
+import { Save, X, AlertCircle, CheckCircle2, Eye, EyeOff } from 'lucide-react';
 
 import { Button } from './Button';
 import { Input } from './Input';
@@ -21,6 +21,7 @@ import {
   type VarInfo,
   type VarScope,
 } from '@/lib/variables-context';
+import { isDynamicVariable, resolveDynamicVariable } from '@/lib/variables';
 import { cn } from '@/lib/util';
 
 interface Props {
@@ -40,6 +41,63 @@ export function VarEditor({ name, onClose, className }: Props) {
   const ctx = useVariables();
   const info = ctx?.vars.get(name);
 
+  // Postman-style dynamic variables ({{$guid}}, {{$timestamp}}, …) are
+  // generated per send and can't be edited — show a sample value instead.
+  if (!info && isDynamicVariable(name)) {
+    return (
+      <DynamicVarPreview name={name} onClose={onClose} className={className} />
+    );
+  }
+  return <VarEditorBody name={name} info={info} onClose={onClose} className={className} />;
+}
+
+function DynamicVarPreview({ name, onClose, className }: Props) {
+  const [sample] = useState(() => resolveDynamicVariable(name) ?? '');
+  return (
+    <div
+      className={cn(
+        'flex w-72 flex-col gap-2 rounded-md border border-border bg-bg-elevated p-2 shadow-xl',
+        className,
+      )}
+      onMouseDown={(e) => e.stopPropagation()}
+      onClick={(e) => e.stopPropagation()}
+      onMouseMove={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-mono text-13 font-semibold text-accent" title={name}>
+          {name}
+        </span>
+        <button
+          type="button"
+          onClick={onClose}
+          className="rounded p-0.5 text-text-muted hover:bg-bg hover:text-text"
+          aria-label="Close"
+        >
+          <X size={12} />
+        </button>
+      </div>
+      <div className="flex items-center gap-1 text-[10px] uppercase tracking-wide text-text-muted">
+        <span>In</span>
+        <span className="rounded-sm bg-bg px-1.5 py-0.5 font-semibold text-text">Dynamic</span>
+      </div>
+      <div className="truncate font-mono text-13 text-text" title={sample}>
+        {sample}
+      </div>
+      <span className="text-[10px] text-text-muted">
+        Generated fresh on every send — example value shown.
+      </span>
+    </div>
+  );
+}
+
+function VarEditorBody({
+  name,
+  info,
+  onClose,
+  className,
+}: Props & { info: VarInfo | undefined }) {
+  const ctx = useVariables();
+
   // Decide where to save. If the variable was resolved, write to that scope;
   // otherwise default to the active environment (or globals if no env active).
   const target: { scope: VarScope; scopeId: string | null; scopeName: string } =
@@ -50,6 +108,8 @@ export function VarEditor({ name, onClose, className }: Props) {
         : { scope: 'globals', scopeId: null, scopeName: 'Globals' };
 
   const [value, setValue] = useState(info?.value ?? '');
+  // Secret variables start masked (Postman parity); the eye toggles.
+  const [reveal, setReveal] = useState(!info?.secret);
   const [error, setError] = useState<string | null>(null);
   const [savedFlash, setSavedFlash] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
@@ -131,6 +191,7 @@ export function VarEditor({ name, onClose, className }: Props) {
           snappy; subsequent focuses behave normally. */}
       <Input
         ref={inputRef}
+        type={reveal ? 'text' : 'password'}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onFocus={() => {
@@ -162,7 +223,18 @@ export function VarEditor({ name, onClose, className }: Props) {
       )}
 
       <div className="flex items-center justify-between">
-        <span className="text-[10px] text-text-muted">
+        <span className="flex items-center gap-1 text-[10px] text-text-muted">
+          {info?.secret && (
+            <button
+              type="button"
+              onClick={() => setReveal((r) => !r)}
+              className="rounded p-0.5 hover:bg-bg hover:text-text"
+              title={reveal ? 'Hide value' : 'Reveal secret'}
+              aria-label={reveal ? 'Hide value' : 'Reveal secret'}
+            >
+              {reveal ? <EyeOff size={11} /> : <Eye size={11} />}
+            </button>
+          )}
           ⏎ to save · Esc to cancel
         </span>
         <Button
@@ -187,14 +259,24 @@ export function VarEditor({ name, onClose, className }: Props) {
 }
 
 function upsertVar(
-  list: Array<{ key: string; value: string; secret?: boolean }>,
+  list: Array<{ key: string; value: string; secret?: boolean; enabled?: boolean }>,
   key: string,
   value: string,
 ) {
-  const idx = list.findIndex((v) => v.key === key);
+  // Update the LAST matching row: with duplicate keys the last one wins at
+  // resolve time, so that's the one the user sees in {{key}}.
+  let idx = -1;
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i]!.key === key) {
+      idx = i;
+      break;
+    }
+  }
   if (idx === -1) return [...list, { key, value }];
   const next = list.slice();
-  next[idx] = { ...next[idx]!, value };
+  // Saving from the popup re-enables a row the user had unchecked; otherwise
+  // the edit would be invisible in {{key}} substitution.
+  next[idx] = { ...next[idx]!, value, enabled: true };
   return next;
 }
 

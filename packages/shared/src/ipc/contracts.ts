@@ -238,7 +238,11 @@ export const MockStopContract = {
 // WebSocket — persistent connection lives in main; messages are pushed back
 // to the renderer via 'volt:event' with kind 'ws:message' or 'ws:state'.
 export const WsOpenContract = {
-  input: z.object({ url: z.string() }),
+  input: z.object({
+    url: z.string(),
+    headers: z.record(z.string()).optional(),
+    protocols: z.array(z.string()).optional(),
+  }),
   output: z.object({ connectionId: z.string(), ok: z.boolean(), error: z.string().optional() }),
 } as const;
 export const WsSendContract = {
@@ -246,7 +250,11 @@ export const WsSendContract = {
   output: z.object({ ok: z.boolean(), error: z.string().optional() }),
 } as const;
 export const WsCloseContract = {
-  input: z.object({ connectionId: z.string() }),
+  input: z.object({
+    connectionId: z.string(),
+    code: z.number().int().optional(),
+    reason: z.string().optional(),
+  }),
   output: z.object({ ok: z.boolean() }),
 } as const;
 
@@ -265,6 +273,30 @@ export const WorkspaceListContract = {
 export const WorkspaceCreateContract = {
   input: z.object({ name: z.string().min(1).max(120), teamId: uuid.optional() }),
   output: Workspace,
+} as const;
+
+// ─────────────────────────────────────────────────────────
+// Desktop widget (macOS "Volt Quick Run")
+// ─────────────────────────────────────────────────────────
+
+export const WidgetFavoritesContract = {
+  input: z.object({}),
+  output: z.object({ requestIds: z.array(z.string()), supported: z.boolean() }),
+} as const;
+
+export const WidgetSetFavoriteContract = {
+  input: z.object({ requestId: uuid, favorite: z.boolean() }),
+  output: z.object({ requestIds: z.array(z.string()) }),
+} as const;
+
+export const WidgetReadyContract = {
+  input: z.object({}),
+  output: z.object({ ok: z.boolean() }),
+} as const;
+
+export const WidgetRunResultContract = {
+  input: z.object({ runId: z.string().min(1).max(64), ok: z.boolean(), error: z.string().max(500).optional() }),
+  output: z.object({ ok: z.boolean() }),
 } as const;
 
 export const WorkspaceRenameContract = {
@@ -311,6 +343,12 @@ export const CollectionUpdateContract = {
 export const CollectionDeleteContract = {
   input: z.object({ id: uuid }),
   output: z.object({ deleted: z.boolean() }),
+} as const;
+
+/** Deep-copy a collection (sub-folders + requests) next to the original. */
+export const CollectionDuplicateContract = {
+  input: z.object({ id: uuid }),
+  output: Collection.nullable(),
 } as const;
 
 export const CollectionExportContract = {
@@ -762,6 +800,7 @@ export const IPC = {
   'collection:create': CollectionCreateContract,
   'collection:update': CollectionUpdateContract,
   'collection:delete': CollectionDeleteContract,
+  'collection:duplicate': CollectionDuplicateContract,
   'collection:export': CollectionExportContract,
 
   'apiRequest:list': RequestListContract,
@@ -794,6 +833,11 @@ export const IPC = {
   'team:billingCheckout': TeamBillingCheckoutContract,
   'team:billingPortal': TeamBillingPortalContract,
   'team:auditLog': TeamAuditLogContract,
+
+  'widget:favorites': WidgetFavoritesContract,
+  'widget:setFavorite': WidgetSetFavoriteContract,
+  'widget:ready': WidgetReadyContract,
+  'widget:runResult': WidgetRunResultContract,
 
   'globals:list': GlobalsListContract,
   'globals:set': GlobalsSetContract,

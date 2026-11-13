@@ -16,7 +16,8 @@ export type GenBody =
   | { type: 'raw'; content: string; language?: string }
   | { type: 'urlencoded'; content: string }
   | { type: 'form'; fields: Array<{ key: string; kind: 'text' | 'file'; value: string }> }
-  | { type: 'binary'; filePath: string };
+  | { type: 'binary'; filePath: string }
+  | { type: 'graphql'; query: string; variables?: string; operationName?: string };
 
 export interface GenRequest {
   method: string;
@@ -55,7 +56,8 @@ export const LANGUAGES: LanguageMeta[] = [
   { id: 'ruby', label: 'Ruby · Net::HTTP', hl: 'ruby' },
 ];
 
-export function generate(lang: Language, req: GenRequest): string {
+export function generate(lang: Language, input: GenRequest): string {
+  const req = normalize(input);
   switch (lang) {
     case 'curl':
       return toCurl(req);
@@ -81,6 +83,39 @@ export function generate(lang: Language, req: GenRequest): string {
 // ─────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────
+
+/**
+ * Fold body kinds the per-language generators don't know about into ones they
+ * do: GraphQL becomes the JSON envelope the engine actually sends; anything
+ * unrecognised (e.g. a gRPC body) is treated as no body.
+ */
+function normalize(req: GenRequest): GenRequest {
+  const body = req.body as { type?: string } | null | undefined;
+  if (!body || typeof body !== 'object') return { ...req, body: { type: 'none' } };
+  if (body.type === 'graphql') {
+    const g = req.body as Extract<GenBody, { type: 'graphql' }>;
+    let variables: unknown = undefined;
+    if (g.variables && g.variables.trim()) {
+      try {
+        variables = JSON.parse(g.variables);
+      } catch {
+        variables = g.variables;
+      }
+    }
+    const envelope: Record<string, unknown> = { query: g.query };
+    if (variables !== undefined) envelope.variables = variables;
+    if (g.operationName) envelope.operationName = g.operationName;
+    const headers = { ...req.headers };
+    if (!Object.keys(headers).some((k) => k.toLowerCase() === 'content-type')) {
+      headers['Content-Type'] = 'application/json';
+    }
+    return { ...req, headers, body: { type: 'raw', language: 'json', content: JSON.stringify(envelope, null, 2) } };
+  }
+  if (!['none', 'raw', 'urlencoded', 'form', 'binary'].includes(body.type ?? '')) {
+    return { ...req, body: { type: 'none' } };
+  }
+  return req;
+}
 
 function sortedHeaders(req: GenRequest): Array<[string, string]> {
   return Object.entries(req.headers).sort(([a], [b]) => a.localeCompare(b));
@@ -134,6 +169,9 @@ function toCurl(req: GenRequest): string {
       for (const f of req.body.fields) {
         if (f.kind === 'file') {
           lines.push(`  --form ${shellSingle(`${f.key}=@${f.value}`)} \\`);
+        } else if (/^[@<]/.test(f.value) || f.value.includes(';')) {
+          // curl would treat a leading @/< as a file and `;` as an option separator.
+          lines.push(`  --form-string ${shellSingle(`${f.key}=${f.value}`)} \\`);
         } else {
           lines.push(`  --form ${shellSingle(`${f.key}=${f.value}`)} \\`);
         }
@@ -193,7 +231,9 @@ function fetchBodyExpr(req: GenRequest): string | null {
       return lines.join('\n');
     }
     case 'binary':
-      return `/* read ${jsString(req.body.filePath)} as a Blob/Buffer before sending */`;
+      return `undefined /* read ${jsString(req.body.filePath)} as a Blob/Buffer and pass it here */`;
+    default:
+      return null;
   }
 }
 
@@ -235,7 +275,7 @@ function toAxios(req: GenRequest): string {
     fd.push('    return fd;', '  })()');
     config.push(`  data: ${fd.join('\n')},`);
   } else if (body.type === 'binary') {
-    config.push(`  data: /* read ${jsString(body.filePath)} as a stream/Buffer */,`);
+    config.push(`  data: undefined /* read ${jsString(body.filePath)} as a stream/Buffer and pass it here */,`);
   }
 
   lines.push(`const response = await axios({`);
@@ -315,11 +355,28 @@ function pyString(s: string): string {
 }
 function pyJson(s: string): string {
   try {
-    const parsed = JSON.parse(s);
-    return JSON.stringify(parsed, null, 4);
+    return pyLiteral(JSON.parse(s), 0);
   } catch {
     return pyString(s);
   }
+}
+
+/** Render a JSON value as a Python literal (true/false/null → True/False/None). */
+function pyLiteral(v: unknown, depth: number): string {
+  const pad = '    '.repeat(depth + 1);
+  const end = '    '.repeat(depth);
+  if (v === null) return 'None';
+  if (v === true) return 'True';
+  if (v === false) return 'False';
+  if (typeof v === 'number') return Number.isFinite(v) ? String(v) : 'None';
+  if (typeof v === 'string') return pyString(v);
+  if (Array.isArray(v)) {
+    if (v.length === 0) return '[]';
+    return `[\n${v.map((x) => pad + pyLiteral(x, depth + 1)).join(',\n')}\n${end}]`;
+  }
+  const entries = Object.entries(v as Record<string, unknown>);
+  if (entries.length === 0) return '{}';
+  return `{\n${entries.map(([k, x]) => `${pad}${pyString(k)}: ${pyLiteral(x, depth + 1)}`).join(',\n')}\n${end}}`;
 }
 
 // ─────────────────────────────────────────────────────────
@@ -331,11 +388,17 @@ function toGo(req: GenRequest): string {
   const lines: string[] = [];
   lines.push('package main');
   lines.push('');
+  const body = req.body;
+  const useStrings = body.type === 'raw' || body.type === 'urlencoded';
+  const useForm = body.type === 'form';
+  const useFile = body.type === 'binary' || (useForm && body.fields.some((f) => f.kind === 'file'));
   lines.push('import (');
+  if (useForm) lines.push('\t"bytes"');
   lines.push('\t"fmt"');
   lines.push('\t"io"');
+  if (useForm) lines.push('\t"mime/multipart"');
   lines.push('\t"net/http"');
-  const useStrings = req.body.type === 'raw' || req.body.type === 'urlencoded';
+  if (useFile) lines.push('\t"os"');
   if (useStrings) lines.push('\t"strings"');
   lines.push(')');
   lines.push('');
@@ -343,10 +406,36 @@ function toGo(req: GenRequest): string {
   if (useStrings) {
     lines.push(`\tpayload := strings.NewReader(${goString(rawBodyContent(req) ?? '')})`);
     lines.push(`\treq, _ := http.NewRequest("${m}", ${goString(req.url)}, payload)`);
+  } else if (body.type === 'form') {
+    lines.push('\tvar buf bytes.Buffer');
+    lines.push('\tmw := multipart.NewWriter(&buf)');
+    for (const f of body.fields) {
+      if (f.kind === 'file') {
+        lines.push(`\tif file, err := os.Open(${goString(f.value)}); err == nil {`);
+        lines.push(`\t\tpart, _ := mw.CreateFormFile(${goString(f.key)}, ${goString(f.value.split(/[\\/]/).pop() ?? f.value)})`);
+        lines.push('\t\tio.Copy(part, file)');
+        lines.push('\t\tfile.Close()');
+        lines.push('\t}');
+      } else {
+        lines.push(`\tmw.WriteField(${goString(f.key)}, ${goString(f.value)})`);
+      }
+    }
+    lines.push('\tmw.Close()');
+    lines.push(`\treq, _ := http.NewRequest("${m}", ${goString(req.url)}, &buf)`);
+    lines.push('\treq.Header.Set("Content-Type", mw.FormDataContentType())');
+  } else if (body.type === 'binary') {
+    lines.push(`\tfile, err := os.Open(${goString(body.filePath)})`);
+    lines.push('\tif err != nil {');
+    lines.push('\t\tfmt.Println(err)');
+    lines.push('\t\treturn');
+    lines.push('\t}');
+    lines.push('\tdefer file.Close()');
+    lines.push(`\treq, _ := http.NewRequest("${m}", ${goString(req.url)}, file)`);
   } else {
     lines.push(`\treq, _ := http.NewRequest("${m}", ${goString(req.url)}, nil)`);
   }
   for (const [k, v] of sortedHeaders(req)) {
+    if (useForm && k.toLowerCase() === 'content-type') continue; // multipart boundary is set above
     lines.push(`\treq.Header.Set(${goString(k)}, ${goString(v)})`);
   }
   lines.push('\tres, err := http.DefaultClient.Do(req)');
@@ -404,10 +493,15 @@ function toJava(req: GenRequest): string {
     lines.push(`RequestBody body = RequestBody.create(new java.io.File(${jsString(body.filePath)}), MediaType.parse("application/octet-stream"));`);
     bodyExpr = 'body';
   }
+  // OkHttp rejects a null body on POST/PUT/PATCH ("method X must have a request body").
+  if (bodyExpr === 'null' && (m === 'POST' || m === 'PUT' || m === 'PATCH')) {
+    lines.push('RequestBody body = RequestBody.create(new byte[0], null);');
+    bodyExpr = 'body';
+  }
   lines.push('Request.Builder rb = new Request.Builder()');
   lines.push(`  .url(${jsString(req.url)})`);
   // OkHttp's .method() handles all verbs uniformly when given a body (null for GET/HEAD)
-  lines.push(`  .method(${jsString(m)}, ${bodyExpr === 'null' && (m === 'GET' || m === 'HEAD') ? 'null' : bodyExpr})`);
+  lines.push(`  .method(${jsString(m)}, ${bodyExpr})`);
   for (const [k, v] of sortedHeaders(req)) {
     lines.push(`  .addHeader(${jsString(k)}, ${jsString(v)})`);
   }
@@ -511,5 +605,6 @@ function toRuby(req: GenRequest): string {
 }
 
 function rubyString(s: string): string {
-  return JSON.stringify(s); // double-quoted JSON-escaped is valid Ruby
+  // Double-quoted JSON-escaped is valid Ruby, except `#{…}` interpolates — escape the `#`.
+  return JSON.stringify(s).replace(/#(?=[{$@])/g, '\\#');
 }

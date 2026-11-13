@@ -19,9 +19,13 @@ export function NewCollectionModal() {
   async function submit(e: FormEvent) {
     e.preventDefault();
     if (!workspaceId || !name.trim()) return;
-    await create.mutateAsync({ workspaceId, parentId, name: name.trim() });
-    setName('');
-    close();
+    try {
+      await create.mutateAsync({ workspaceId, parentId, name: name.trim() });
+      setName('');
+      close();
+    } catch {
+      // Hook already toasts the error; keep the modal open so the user can retry.
+    }
   }
 
   return (

@@ -33,6 +33,23 @@ export function CommandPalette() {
     return map;
   }, [collections]);
 
+  // Pre-filter on our side before capping the list. Slicing the raw list
+  // first meant any request past #50 could never be found by typing.
+  const visibleRequests = useMemo(() => {
+    const all = requests ?? [];
+    const q = query.trim().toLowerCase();
+    const filtered = q
+      ? all.filter(
+          (r) =>
+            r.name.toLowerCase().includes(q) ||
+            r.url.toLowerCase().includes(q) ||
+            r.method.toLowerCase().includes(q) ||
+            (r.collectionId && (collectionNames.get(r.collectionId) ?? '').toLowerCase().includes(q)),
+        )
+      : all;
+    return filtered.slice(0, 50);
+  }, [requests, query, collectionNames]);
+
   return (
     <Command.Dialog
       open={isOpen}
@@ -55,12 +72,12 @@ export function CommandPalette() {
           No results.
         </Command.Empty>
 
-        {requests && requests.length > 0 && (
+        {visibleRequests.length > 0 && (
           <Command.Group heading="Requests" className="cmd-group">
-            {requests.slice(0, 50).map((r) => (
+            {visibleRequests.map((r) => (
               <Command.Item
                 key={r.id}
-                value={`${r.method} ${r.name} ${r.url}`}
+                value={`${r.method} ${r.name} ${r.url} ${r.id}`}
                 onSelect={() => {
                   selectRequest(r.id);
                   close();

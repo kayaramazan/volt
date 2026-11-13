@@ -56,12 +56,12 @@ export function MockSettingsModal() {
           ) : (
             <span>Stopped</span>
           )}
-          {status?.error && (
-            <span className="ml-auto text-error" title={status.error}>
-              ⚠ Error
-            </span>
-          )}
         </div>
+        {status?.error && !running && (
+          <p className="rounded border border-error/30 bg-error/10 px-2 py-1.5 text-[11px] text-error">
+            {status.error}
+          </p>
+        )}
 
         <label className="text-xs text-text-muted">
           Port

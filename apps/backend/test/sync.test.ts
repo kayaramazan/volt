@@ -1,5 +1,4 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
-import { Test } from '@nestjs/testing';
 import { prisma, TeamRole } from '@volt/db';
 import { randomUUID } from 'node:crypto';
 import argon2 from 'argon2';
@@ -15,10 +14,9 @@ describe('SyncService — last-write-wins', () => {
   let workspaceId: string;
 
   beforeAll(async () => {
-    const moduleRef = await Test.createTestingModule({
-      providers: [SyncService, SyncStreamService],
-    }).compile();
-    sync = moduleRef.get(SyncService);
+    // Construct directly: vitest's esbuild transform doesn't emit decorator
+    // metadata, so Nest's DI would inject `undefined` for the stream service.
+    sync = new SyncService(new SyncStreamService());
   });
 
   beforeEach(async () => {

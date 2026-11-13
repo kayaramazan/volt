@@ -25,16 +25,43 @@ interface OAuth2Config {
   tokenCacheKey: string;
 }
 
+/**
+ * Cache key for the persisted token. Requests created in the UI get a random
+ * `tokenCacheKey`; imported / older rows may have an empty one, so fall back
+ * to a deterministic key. Must be used by every read AND write so the
+ * auth-code exchange and `ensureToken` agree on where the token lives.
+ */
+function cacheKey(cfg: OAuth2Config): string {
+  return cfg.tokenCacheKey || `${cfg.grant}_${cfg.clientId}_${cfg.tokenUrl}`;
+}
+
+function requireTokenUrl(cfg: OAuth2Config): string {
+  const url = (cfg.tokenUrl ?? '').trim();
+  if (!url) throw new Error('OAuth 2.0: Token URL is required.');
+  try {
+    new URL(url);
+  } catch {
+    throw new Error(`OAuth 2.0: Token URL is not a valid URL: ${url}`);
+  }
+  return url;
+}
+
 /** Returns a still-valid access token, fetching/refreshing if needed. */
 export async function ensureToken(cfg: OAuth2Config): Promise<OAuthToken | null> {
-  const key = cfg.tokenCacheKey || `${cfg.grant}_${cfg.clientId}_${cfg.tokenUrl}`;
+  const key = cacheKey(cfg);
   const cached = getOAuthToken(key);
   if (cached && !isExpired(cached)) return cached;
   if (cached?.refreshToken) {
-    const refreshed = await refreshToken(cfg, cached.refreshToken);
-    if (refreshed) {
-      setOAuthToken(key, refreshed);
-      return refreshed;
+    // A failed refresh is not fatal: for machine grants we re-fetch below,
+    // for auth-code the user has to re-authorize (null → clear message).
+    try {
+      const refreshed = await refreshToken(cfg, cached.refreshToken);
+      if (refreshed) {
+        setOAuthToken(key, refreshed);
+        return refreshed;
+      }
+    } catch (err) {
+      console.warn('[oauth] refresh failed:', (err as Error).message);
     }
   }
   if (cfg.grant === 'client_credentials' || cfg.grant === 'password') {
@@ -73,6 +100,7 @@ async function refreshToken(cfg: OAuth2Config, refresh: string): Promise<OAuthTo
 }
 
 async function tokenRequest(cfg: OAuth2Config, body: URLSearchParams): Promise<OAuthToken | null> {
+  const tokenUrl = requireTokenUrl(cfg);
   const headers: Record<string, string> = {
     'Content-Type': 'application/x-www-form-urlencoded',
     Accept: 'application/json',
@@ -83,20 +111,46 @@ async function tokenRequest(cfg: OAuth2Config, body: URLSearchParams): Promise<O
   } else if (cfg.clientId) {
     body.set('client_id', cfg.clientId);
   }
-  const res = await fetch(cfg.tokenUrl, { method: 'POST', headers, body });
-  if (!res.ok) return null;
-  const data = (await res.json()) as {
-    access_token?: string;
-    refresh_token?: string;
-    expires_in?: number;
-    token_type?: string;
-  };
-  if (!data.access_token) return null;
+  const res = await fetch(tokenUrl, { method: 'POST', headers, body });
+  return parseTokenResponse(res);
+}
+
+interface TokenResponse {
+  access_token?: string;
+  refresh_token?: string;
+  expires_in?: number | string;
+  token_type?: string;
+  error?: string;
+  error_description?: string;
+}
+
+/**
+ * Turn a token-endpoint response into an OAuthToken, or throw with the
+ * provider's own error text so the user sees *why* (invalid_client, bad
+ * scope, …) instead of a generic "no token".
+ */
+async function parseTokenResponse(res: Response): Promise<OAuthToken> {
+  const text = await res.text();
+  let data: TokenResponse = {};
+  try {
+    data = JSON.parse(text) as TokenResponse;
+  } catch {
+    // Some providers (e.g. older GitHub) answer form-encoded.
+    data = Object.fromEntries(new URLSearchParams(text)) as TokenResponse;
+  }
+  if (!res.ok || data.error || !data.access_token) {
+    const detail =
+      data.error_description ??
+      data.error ??
+      (res.ok ? 'response did not contain access_token' : text.slice(0, 200) || res.statusText);
+    throw new Error(`OAuth 2.0 token request failed (${res.status}): ${detail}`);
+  }
+  const expiresIn = Number(data.expires_in);
   return {
     accessToken: data.access_token,
     refreshToken: data.refresh_token,
     tokenType: data.token_type ?? 'Bearer',
-    expiresAt: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,
+    expiresAt: Number.isFinite(expiresIn) && expiresIn > 0 ? Date.now() + expiresIn * 1000 : undefined,
   };
 }
 
@@ -105,18 +159,27 @@ async function tokenRequest(cfg: OAuth2Config, body: URLSearchParams): Promise<O
  * Returns the URL to send the user to + the verifier the renderer should
  * persist (and pass back when exchanging the code).
  */
-export function buildAuthCodeUrl(cfg: OAuth2Config): { url: string; verifier: string } {
+export function buildAuthCodeUrl(cfg: OAuth2Config): { url: string; verifier: string; state: string } {
+  const authUrl = (cfg.authUrl ?? '').trim();
+  if (!authUrl) throw new Error('OAuth 2.0: Authorize URL is required for the authorization code grant.');
+  if (!cfg.clientId) throw new Error('OAuth 2.0: Client ID is required.');
+  let u: URL;
+  try {
+    u = new URL(authUrl);
+  } catch {
+    throw new Error(`OAuth 2.0: Authorize URL is not a valid URL: ${authUrl}`);
+  }
   const verifier = randomString(64);
   const challenge = pkceChallenge(verifier);
-  const u = new URL(cfg.authUrl ?? '');
+  const state = randomString(16);
   u.searchParams.set('response_type', 'code');
   u.searchParams.set('client_id', cfg.clientId);
-  if (cfg.redirectUri) u.searchParams.set('redirect_uri', cfg.redirectUri);
+  if (cfg.redirectUri) u.searchParams.set('redirect_uri', cfg.redirectUri.trim());
   if (cfg.scope) u.searchParams.set('scope', cfg.scope);
   u.searchParams.set('code_challenge', challenge);
   u.searchParams.set('code_challenge_method', 'S256');
-  u.searchParams.set('state', randomString(16));
-  return { url: u.toString(), verifier };
+  u.searchParams.set('state', state);
+  return { url: u.toString(), verifier, state };
 }
 
 export async function exchangeAuthCode(
@@ -124,11 +187,13 @@ export async function exchangeAuthCode(
   code: string,
   verifier: string,
 ): Promise<OAuthToken | null> {
+  const tokenUrl = requireTokenUrl(cfg);
+  if (!code) throw new Error('OAuth 2.0: authorization code is empty.');
   const body = new URLSearchParams();
   body.set('grant_type', 'authorization_code');
   body.set('code', code);
   body.set('client_id', cfg.clientId);
-  if (cfg.redirectUri) body.set('redirect_uri', cfg.redirectUri);
+  if (cfg.redirectUri) body.set('redirect_uri', cfg.redirectUri.trim());
   body.set('code_verifier', verifier);
   const headers: Record<string, string> = {
     'Content-Type': 'application/x-www-form-urlencoded',
@@ -138,22 +203,11 @@ export async function exchangeAuthCode(
     headers.Authorization =
       'Basic ' + Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString('base64');
   }
-  const res = await fetch(cfg.tokenUrl, { method: 'POST', headers, body });
-  if (!res.ok) return null;
-  const data = (await res.json()) as {
-    access_token?: string;
-    refresh_token?: string;
-    expires_in?: number;
-    token_type?: string;
-  };
-  if (!data.access_token) return null;
-  const token: OAuthToken = {
-    accessToken: data.access_token,
-    refreshToken: data.refresh_token,
-    tokenType: data.token_type ?? 'Bearer',
-    expiresAt: data.expires_in ? Date.now() + data.expires_in * 1000 : undefined,
-  };
-  setOAuthToken(cfg.tokenCacheKey, token);
+  const res = await fetch(tokenUrl, { method: 'POST', headers, body });
+  const token = await parseTokenResponse(res);
+  // Same key `ensureToken` reads — previously this wrote to the raw (possibly
+  // empty) tokenCacheKey, so a successful exchange was never found at send time.
+  setOAuthToken(cacheKey(cfg), token);
   return token;
 }
 

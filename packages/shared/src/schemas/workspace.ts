@@ -10,6 +10,10 @@ export const Variable = z.object({
   value: z.string().max(10_000),
   // If present, value is empty and the real value lives in OS keychain at this ref.
   secretRef: z.string().nullable().optional(),
+  // Postman parity: unchecked rows are kept but skipped during {{}} resolution.
+  enabled: z.boolean().optional(),
+  // Postman "secret" type: value is masked in the UI (still stored as-is).
+  secret: z.boolean().optional(),
 });
 export type Variable = z.infer<typeof Variable>;
 

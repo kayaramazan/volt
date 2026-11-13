@@ -127,6 +127,7 @@ export function BodyEditor({ body, onChange }: Props) {
                 key: f.key,
                 value: f.value,
                 enabled: f.enabled,
+                kind: f.kind,
               }))}
               onChange={(rows) =>
                 onChange({
@@ -136,14 +137,36 @@ export function BodyEditor({ body, onChange }: Props) {
                     key: r.key,
                     value: r.value,
                     enabled: r.enabled,
-                    kind: body.fields.find((f) => f.id === r.id)?.kind ?? 'text',
+                    kind: r.kind ?? body.fields.find((f) => f.id === r.id)?.kind ?? 'text',
                   })),
                 })
               }
+              renderValue={(row, patch) =>
+                row.kind === 'file' ? (
+                  <FileCell
+                    path={row.value}
+                    onPick={(filePath) => patch({ value: filePath })}
+                    onClear={() => patch({ value: '' })}
+                  />
+                ) : null
+              }
+              renderRowExtra={(row, patch) => (
+                <select
+                  value={row.kind ?? 'text'}
+                  onChange={(e) => {
+                    const kind = e.target.value as 'text' | 'file';
+                    // A file path makes no sense as a text value (and vice
+                    // versa) — clear it when the kind flips.
+                    patch(kind === row.kind ? { kind } : { kind, value: '' });
+                  }}
+                  className="rounded border border-border bg-bg px-1 py-0.5 text-[10px] text-text-muted outline-none hover:text-text"
+                  title="Send this field as text or as a file upload"
+                >
+                  <option value="text">Text</option>
+                  <option value="file">File</option>
+                </select>
+              )}
             />
-            <p className="border-t border-border px-2 py-1 text-[10px] text-text-muted">
-              For file fields, edit JSON manually in v1.0 — file picker coming soon.
-            </p>
           </div>
         )}
         {body.type === 'graphql' && (
@@ -192,6 +215,46 @@ export function BodyEditor({ body, onChange }: Props) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+/** Value cell for a form-data file row: pick / show / clear a file path. */
+function FileCell({
+  path,
+  onPick,
+  onClear,
+}: {
+  path: string;
+  onPick: (filePath: string) => void;
+  onClear: () => void;
+}) {
+  const name = path ? (path.split(/[\\/]/).pop() ?? path) : '';
+  return (
+    <div className="flex min-w-0 flex-1 items-center gap-1 px-1 text-xs">
+      <button
+        type="button"
+        onClick={async () => {
+          const result = await window.volt['app:showFilePicker']({});
+          if (!result.cancelled && result.filePath) onPick(result.filePath);
+        }}
+        className="rounded border border-border px-2 py-0.5 text-[10px] text-text hover:bg-bg-elevated"
+      >
+        {path ? 'Change…' : 'Choose file…'}
+      </button>
+      <span className={path ? 'truncate text-text' : 'text-text-muted'} title={path || undefined}>
+        {name || 'No file selected'}
+      </span>
+      {path && (
+        <button
+          type="button"
+          onClick={onClear}
+          className="text-text-muted hover:text-error"
+          title="Clear file"
+        >
+          ×
+        </button>
+      )}
     </div>
   );
 }

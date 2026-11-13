@@ -74,7 +74,8 @@ export function exportOpenAPI(
   const opCounter = new Map<string, number>();
 
   for (const r of requests) {
-    const pathname = pathnameOf(r.url) || '/';
+    // Postman-style `:id` segments become OpenAPI `{id}` templates.
+    const pathname = (pathnameOf(r.url) || '/').replace(/\/:([A-Za-z_][\w-]*)/g, '/{$1}');
     if (!paths[pathname]) paths[pathname] = {};
     const method = r.method.toLowerCase();
 
@@ -187,8 +188,8 @@ function buildParameters(r: RequestRow): unknown[] | undefined {
       schema: { type: 'string', example: h.value },
     });
   }
-  // Path templating: detect `{foo}` placeholders in the URL pathname.
-  const pn = pathnameOf(r.url) || '';
+  // Path templating: detect `{foo}` placeholders (and Postman-style `:foo`) in the URL pathname.
+  const pn = (pathnameOf(r.url) || '').replace(/\/:([A-Za-z_][\w-]*)/g, '/{$1}');
   const pathVars = [...pn.matchAll(/\{([^/{}]+)\}/g)].map((m) => m[1]);
   for (const name of pathVars) {
     params.push({
@@ -226,7 +227,11 @@ function buildRequestBody(r: RequestRow): unknown {
       };
     }
     case 'urlencoded': {
-      const params = parseQueryPairs((b.content as string | undefined) ?? '');
+      // Volt stores key/value rows; older rows may carry an encoded `content` string.
+      const params =
+        (b.fields as Array<{ key: string; value: string; enabled?: boolean }> | undefined)?.filter(
+          (f) => f.enabled !== false && f.key,
+        ) ?? parseQueryPairs((b.content as string | undefined) ?? '');
       const props: Record<string, unknown> = {};
       for (const p of params) props[p.key] = { type: 'string', example: p.value };
       return {
@@ -264,6 +269,21 @@ function buildRequestBody(r: RequestRow): unknown {
           },
         },
       };
+    case 'graphql': {
+      let variables: unknown = {};
+      try {
+        variables = JSON.parse((b.variables as string | undefined) || '{}');
+      } catch {
+        variables = (b.variables as string | undefined) ?? '';
+      }
+      return {
+        content: {
+          'application/json': {
+            example: { query: (b.query as string | undefined) ?? '', variables },
+          },
+        },
+      };
+    }
     default:
       return undefined;
   }

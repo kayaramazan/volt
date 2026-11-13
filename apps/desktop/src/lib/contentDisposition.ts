@@ -23,7 +23,36 @@ const TYPE_TO_EXT: Record<string, string> = {
   'image/webp': 'webp',
   'image/svg+xml': 'svg',
   'image/bmp': 'bmp',
+  'image/x-icon': 'ico',
+  'image/avif': 'avif',
+  'image/tiff': 'tiff',
+  'text/markdown': 'md',
+  'application/yaml': 'yaml',
+  'application/x-ndjson': 'ndjson',
+  'application/gzip': 'gz',
+  'application/x-tar': 'tar',
+  'application/wasm': 'wasm',
+  'audio/mpeg': 'mp3',
+  'audio/wav': 'wav',
+  'video/mp4': 'mp4',
+  'video/webm': 'webm',
+  'font/woff': 'woff',
+  'font/woff2': 'woff2',
+  'font/ttf': 'ttf',
 };
+
+/**
+ * A server-supplied filename goes straight into the save dialog's default
+ * path, so strip any directory components (`../../x`) and characters the
+ * OS won't accept.
+ */
+function sanitizeFilename(name: string): string | null {
+  const base = name.split(/[\\/]/).pop() ?? '';
+  // eslint-disable-next-line no-control-regex
+  const cleaned = base.replace(/[\x00-\x1f:*?"<>|]/g, '_').trim();
+  if (!cleaned || cleaned === '.' || cleaned === '..') return null;
+  return cleaned;
+}
 
 export function filenameFromHeaders(headers: [string, string][] | undefined): string | null {
   if (!headers) return null;
@@ -37,15 +66,18 @@ export function filenameFromHeaders(headers: [string, string][] | undefined): st
       const dq = raw.split("'");
       if (dq.length === 3) {
         try {
-          return decodeURIComponent(dq[2]!);
+          const name = sanitizeFilename(decodeURIComponent(dq[2]!.replace(/^"|"$/g, '')));
+          if (name) return name;
         } catch {
           // Fall through to plain.
         }
       }
     }
-    const plain = /filename\s*=\s*("([^"]+)"|([^;]+))/i.exec(v);
+    // `[^"]*` (not `+`) so `filename=""` matches the quoted branch and yields
+    // nothing, instead of the unquoted branch producing a literal `""`.
+    const plain = /filename\s*=\s*(?:"([^"]*)"|([^;]+))/i.exec(v);
     if (plain) {
-      const name = (plain[2] ?? plain[3] ?? '').trim();
+      const name = sanitizeFilename((plain[1] ?? plain[2] ?? '').trim());
       if (name) return name;
     }
   }

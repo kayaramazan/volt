@@ -1,6 +1,7 @@
 // Theme preference: System | Light | Dark. Mirrors the toggle in Settings.
 // Applies a class on <html> so the CSS vars in global.css switch.
 
+import { useEffect, useState } from 'react';
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
@@ -51,3 +52,18 @@ if (typeof window !== 'undefined' && window.matchMedia) {
 
 // Apply once at module load in case rehydration races the first render.
 apply(useTheme.getState().pref);
+
+/** Effective 'light' | 'dark' theme, reactive to the pref and OS changes. */
+export function useEffectiveTheme(): 'light' | 'dark' {
+  const pref = useTheme((s) => s.pref);
+  const [systemDark, setSystemDark] = useState(systemPrefersDark);
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const on = () => setSystemDark(mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  if (pref === 'system') return systemDark ? 'dark' : 'light';
+  return pref;
+}

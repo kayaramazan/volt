@@ -3,10 +3,18 @@
 // Takes an ApiRequest (with {{variables}}) and the active environment +
 // collection variables, produces a ResolvedRequest ready to send.
 //
-// Resolution priority (highest wins):
-//   1. Collection variables (and parent collections, bottom-up)
-//   2. Environment variables
+// Resolution priority (highest wins, Postman parity):
+//   1. Environment variables
+//   2. Collection variables (and parent collections, bottom-up)
+//   3. Globals (per-device key/value store)
+//   4. Dynamic variables ({{$guid}}, {{$timestamp}}, …)
+// Disabled variables (enabled === false) are skipped.
 // Unknown variables become empty strings (we'd warn in UI but not fail).
+//
+// NOTE: the renderer performs the same merge in RequestEditor (resolveLocally)
+// before calling request:send; keep the two in step.
+
+import { randomUUID } from 'node:crypto';
 
 import type {
   ApiRequest,
@@ -26,6 +34,8 @@ interface ResolveContext {
    * direct parent. Variables defined closer to the request take priority.
    */
   collectionChain: Collection[];
+  /** Per-device globals (lowest priority). Non-string values are JSON-encoded. */
+  globals?: Record<string, unknown> | null;
   /**
    * Secret resolver — used to fetch values for variables flagged secretRef.
    * In production this calls keytar; in tests can be a Map lookup.
@@ -93,18 +103,26 @@ export async function resolveRequest(ctx: ResolveContext): Promise<{
 async function collectVariables(ctx: ResolveContext): Promise<Map<string, string>> {
   const map = new Map<string, string>();
 
-  // Environment first — lowest priority, overridden by collection
-  if (ctx.environment) {
-    for (const v of ctx.environment.variables ?? []) {
-      const value = await resolveValue(v, ctx.resolveSecret);
-      map.set(v.key, value);
-    }
+  // Globals first — lowest priority
+  for (const [k, v] of Object.entries(ctx.globals ?? {})) {
+    if (v == null || !k) continue;
+    map.set(k, typeof v === 'string' ? v : JSON.stringify(v));
   }
 
   // Collection chain: root-first, so deeper collections override
   const reversed = [...ctx.collectionChain].reverse();
   for (const c of reversed) {
     for (const v of c.variables ?? []) {
+      if (v.enabled === false || !v.key) continue;
+      const value = await resolveValue(v, ctx.resolveSecret);
+      map.set(v.key, value);
+    }
+  }
+
+  // Environment last — highest priority (Postman: env > collection > global)
+  if (ctx.environment) {
+    for (const v of ctx.environment.variables ?? []) {
+      if (v.enabled === false || !v.key) continue;
       const value = await resolveValue(v, ctx.resolveSecret);
       map.set(v.key, value);
     }
@@ -128,11 +146,24 @@ async function resolveValue(
 // Substitution
 // ─────────────────────────────────────────────────────────
 
-const VAR_PATTERN = /\{\{\s*([\w.-]+)\s*\}\}/g;
+const VAR_PATTERN = /\{\{\s*(\$?[\w.-]+)\s*\}\}/g;
+
+// Postman-style dynamic variables, generated fresh for every occurrence.
+const DYNAMIC: Record<string, () => string> = {
+  $guid: () => randomUUID(),
+  $randomUUID: () => randomUUID(),
+  $timestamp: () => String(Math.floor(Date.now() / 1000)),
+  $isoTimestamp: () => new Date().toISOString(),
+  $randomInt: () => String(Math.floor(Math.random() * 1001)),
+  $randomBoolean: () => String(Math.random() < 0.5),
+};
 
 function substitute(input: string, vars: Map<string, string>, unresolved: Set<string>): string {
+  if (!input || !input.includes('{{')) return input;
   return input.replace(VAR_PATTERN, (match, name: string) => {
     if (vars.has(name)) return vars.get(name)!;
+    const dyn = Object.prototype.hasOwnProperty.call(DYNAMIC, name) ? DYNAMIC[name] : undefined;
+    if (dyn) return dyn();
     unresolved.add(name);
     return '';
   });
@@ -141,6 +172,19 @@ function substitute(input: string, vars: Map<string, string>, unresolved: Set<st
 // ─────────────────────────────────────────────────────────
 // Auth
 // ─────────────────────────────────────────────────────────
+
+/**
+ * Set a header, replacing any existing entry with the same name regardless of
+ * case. Like Postman, the auth helper wins over a manually typed
+ * `authorization:` row — and we never send the header twice.
+ */
+function setHeaderCI(headers: Record<string, string>, name: string, value: string) {
+  const lower = name.toLowerCase();
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === lower) delete headers[k];
+  }
+  headers[name] = value;
+}
 
 function applyAuth(
   auth: RequestAuth,
@@ -154,14 +198,14 @@ function applyAuth(
       return;
     case 'bearer': {
       const token = subst(auth.token);
-      if (token) headers['Authorization'] = `Bearer ${token}`;
+      if (token) setHeaderCI(headers, 'Authorization', `Bearer ${token}`);
       return;
     }
     case 'basic': {
       const u = subst(auth.username);
       const p = subst(auth.password);
       const encoded = Buffer.from(`${u}:${p}`).toString('base64');
-      headers['Authorization'] = `Basic ${encoded}`;
+      setHeaderCI(headers, 'Authorization', `Basic ${encoded}`);
       return;
     }
     case 'apiKey': {
@@ -169,7 +213,7 @@ function applyAuth(
       const value = subst(auth.value);
       if (!key) return;
       if (auth.placement === 'header') {
-        headers[key] = value;
+        setHeaderCI(headers, key, value);
       } else {
         const sep = url.includes('?') ? '&' : '?';
         setUrl(url + sep + `${encodeURIComponent(key)}=${encodeURIComponent(value)}`);

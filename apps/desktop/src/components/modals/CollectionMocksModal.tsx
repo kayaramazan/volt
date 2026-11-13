@@ -3,7 +3,7 @@
 // the first enabled, matching entry. Sharing a mock = sharing the
 // collection — mocks ride on the existing collection sync.
 
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Plus, Trash2, Server } from 'lucide-react';
 
 import { Dialog } from '@/components/ui/Dialog';
@@ -66,6 +66,9 @@ export function CollectionMocksModal() {
 
   const [mocks, setMocks] = useState<Mock[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Raw text of the status field while the user types: clamping to 100–599
+  // on every keystroke made "4" jump to "100", so 404 could never be typed.
+  const [statusDraft, setStatusDraft] = useState('');
 
   // Hydrate when the collection changes (or the modal opens).
   useEffect(() => {
@@ -73,27 +76,63 @@ export function CollectionMocksModal() {
     const cur = (collection as { mocks?: Mock[] }).mocks ?? [];
     setMocks(cur);
     setSelectedId(cur[0]?.id ?? null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collection?.id, isOpen]);
 
   const selected = useMemo(() => mocks.find((m) => m.id === selectedId) ?? null, [mocks, selectedId]);
 
-  function persist(next: Mock[]) {
+  useEffect(() => {
+    setStatusDraft(selected ? String(selected.status) : '');
+  }, [selected?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Debounced write: one DB row + sync push per burst of typing instead of
+  // one per keystroke. Flushed on close/unmount so nothing is lost.
+  const saveTimerRef = useRef<number | null>(null);
+  // Carries its own collection id: by the time the close-cleanup runs the
+  // modal state has already moved on and `collectionId` is null.
+  const pendingRef = useRef<{ id: string; mocks: Mock[] } | null>(null);
+  const updateCollectionRef = useRef(updateCollection);
+  updateCollectionRef.current = updateCollection;
+  const flush = useCallback(() => {
+    if (saveTimerRef.current != null) {
+      clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
+    }
+    const pending = pendingRef.current;
+    pendingRef.current = null;
+    if (!pending) return;
+    void updateCollectionRef.current.mutateAsync({ id: pending.id, mocks: pending.mocks });
+  }, []);
+  useEffect(() => {
+    return () => flush();
+  }, [isOpen, collectionId, flush]);
+
+  function persist(next: Mock[], immediate = false) {
     setMocks(next);
     if (!collectionId) return;
-    void updateCollection.mutateAsync({ id: collectionId, mocks: next });
+    pendingRef.current = { id: collectionId, mocks: next };
+    if (immediate) {
+      flush();
+      return;
+    }
+    if (saveTimerRef.current != null) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      flush();
+    }, 400);
   }
 
   function addMock() {
     const m = blank();
     const next = [...mocks, m];
-    persist(next);
+    persist(next, true);
     setSelectedId(m.id);
   }
 
   function deleteMock(id: string) {
     if (!confirm('Delete this mock?')) return;
     const next = mocks.filter((m) => m.id !== id);
-    persist(next);
+    persist(next, true);
     if (selectedId === id) setSelectedId(next[0]?.id ?? null);
   }
 
@@ -173,7 +212,7 @@ export function CollectionMocksModal() {
                     checked={m.enabled}
                     onChange={(e) => {
                       const next = mocks.map((x) => (x.id === m.id ? { ...x, enabled: e.target.checked } : x));
-                      persist(next);
+                      persist(next, true);
                     }}
                     className="accent-accent"
                     title={m.enabled ? 'Enabled' : 'Disabled'}
@@ -225,10 +264,15 @@ export function CollectionMocksModal() {
                         type="number"
                         min={100}
                         max={599}
-                        value={selected.status}
-                        onChange={(e) =>
-                          patchSelected({ status: Math.max(100, Math.min(599, Number(e.target.value) || 0)) })
-                        }
+                        value={statusDraft}
+                        onChange={(e) => {
+                          const v = e.target.value;
+                          setStatusDraft(v);
+                          const n = Number(v);
+                          if (Number.isInteger(n) && n >= 100 && n <= 599) patchSelected({ status: n });
+                        }}
+                        onBlur={() => setStatusDraft(String(selected.status))}
+                        className="font-mono"
                       />
                     </label>
                   </div>

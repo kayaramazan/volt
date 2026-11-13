@@ -10,6 +10,7 @@ import { useCollections, useUpdateCollection } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
 import { useModals } from '@/stores/modals';
 import { cn } from '@/lib/util';
+import { useEffectiveTheme } from '@/stores/theme';
 
 type ViewMode = 'edit' | 'split' | 'preview';
 
@@ -18,6 +19,7 @@ type ViewMode = 'edit' | 'split' | 'preview';
  * through useUpdateCollection (so it syncs to the backend on cloud workspaces).
  */
 export function CollectionDocsModal() {
+  const editorTheme = useEffectiveTheme();
   const { current, close } = useModals();
   const isOpen = current.kind === 'collection-docs';
   const collectionId = current.kind === 'collection-docs' ? current.collectionId : null;
@@ -33,11 +35,16 @@ export function CollectionDocsModal() {
   const [draft, setDraft] = useState('');
   const [mode, setMode] = useState<ViewMode>('split');
 
-  // Sync draft when modal opens / collection changes
+  // Seed the editor when the modal opens or targets a different collection.
+  // Not keyed on the `collection` object: the collections list refetches on
+  // every reorder / mock change / sync pull, and re-seeding would discard
+  // the user's unsaved edits.
+  const loaded = !!collection;
   useEffect(() => {
     if (!isOpen || !collection) return;
     setDraft((collection as { description?: string }).description ?? '');
-  }, [isOpen, collection]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, collectionId, loaded]);
 
   const dirty =
     (collection &&
@@ -100,7 +107,7 @@ export function CollectionDocsModal() {
                   value={draft}
                   onChange={(v) => setDraft(v)}
                   extensions={[markdown()]}
-                  theme="dark"
+                  theme={editorTheme}
                   basicSetup={{
                     lineNumbers: false,
                     foldGutter: false,

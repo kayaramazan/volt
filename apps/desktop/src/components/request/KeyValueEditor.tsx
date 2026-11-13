@@ -1,5 +1,5 @@
 import { Trash2, GripVertical } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 
 import { HeaderKeyInput } from '@/components/ui/HeaderKeyInput';
 import { HighlightedInput } from '@/components/ui/HighlightedInput';
@@ -11,7 +11,11 @@ export interface KeyValueRow {
   value: string;
   enabled?: boolean;
   description?: string;
+  /** form-data only: file rows carry an absolute path in `value`. */
+  kind?: 'text' | 'file';
 }
+
+type RowPatch = (patch: Partial<KeyValueRow>) => void;
 
 interface Props {
   rows: KeyValueRow[];
@@ -22,6 +26,10 @@ interface Props {
   readOnly?: boolean;
   /** When set, the key column autocompletes from common HTTP headers. */
   suggest?: 'headers';
+  /** Replace the value cell for a row (return null to keep the default input). */
+  renderValue?: (row: KeyValueRow, patch: RowPatch) => ReactNode | null;
+  /** Extra per-row controls rendered between the value cell and the delete button. */
+  renderRowExtra?: (row: KeyValueRow, patch: RowPatch) => ReactNode;
 }
 
 /**
@@ -36,6 +44,8 @@ export function KeyValueEditor({
   valuePlaceholder = 'Value',
   readOnly = false,
   suggest,
+  renderValue,
+  renderRowExtra,
 }: Props) {
   const KeyComponent = suggest === 'headers' ? HeaderKeyInput : HighlightedInput;
   // Ensure there's always a trailing empty row to type into.
@@ -66,6 +76,8 @@ export function KeyValueEditor({
       {internalRows.map((row, i) => {
         const isLast = i === internalRows.length - 1;
         const isEmpty = !row.key && !row.value;
+        const rowPatch: RowPatch = (p) => patch(row.id, p);
+        const customValue = renderValue ? renderValue(row, rowPatch) : null;
         return (
           <div
             key={row.id}
@@ -89,14 +101,17 @@ export function KeyValueEditor({
               className="flex-1"
               disabled={readOnly}
             />
-            <HighlightedInput
-              flat
-              value={row.value}
-              onChange={(e) => patch(row.id, { value: e.target.value })}
-              placeholder={valuePlaceholder}
-              className="flex-1"
-              disabled={readOnly}
-            />
+            {customValue ?? (
+              <HighlightedInput
+                flat
+                value={row.value}
+                onChange={(e) => patch(row.id, { value: e.target.value })}
+                placeholder={valuePlaceholder}
+                className="flex-1"
+                disabled={readOnly}
+              />
+            )}
+            {renderRowExtra?.(row, rowPatch)}
             <button
               type="button"
               onClick={() => remove(row.id)}

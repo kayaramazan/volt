@@ -15,7 +15,6 @@ import vm from 'node:vm';
 import { app } from 'electron';
 
 const PLUGINS_DIR_NAME = 'plugins';
-const REGISTRY_KEY = '__voltRegistry';
 const INVOKE_KEY = '__voltInvokeTransformer';
 const IN_BODY_KEY = '__voltInBody';
 const IN_CTX_KEY = '__voltInCtx';
@@ -115,22 +114,27 @@ export function applyTransformer(input: ApplyTransformerInput): ApplyTransformer
   }
 
   try {
-    // Bind the inputs into the context, invoke through the sandbox-owned
-    // dispatcher, then read the result back. Keeps the transformer's
-    // execution scope inside the plugin's vm context.
+    // Bind the inputs into the context as primitives (a host object would
+    // hand the plugin a path to the host realm via `.constructor`), invoke
+    // through the sandbox-owned dispatcher under the vm timeout, and read
+    // back a JSON string the dispatcher normalised inside the sandbox.
     const ctx = runtime.context as vm.Context & Record<string, unknown>;
     ctx[IN_BODY_KEY] = input.body;
-    ctx[IN_CTX_KEY] = {
+    ctx[IN_CTX_KEY] = JSON.stringify({
       contentType: input.contentType ?? null,
       headers: input.headers ?? {},
-    };
-    const raw = vm.runInContext(
-      `${INVOKE_KEY}(${JSON.stringify(localId)}, ${IN_BODY_KEY}, ${IN_CTX_KEY})`,
-      ctx,
-      { timeout: input.timeoutMs ?? DEFAULT_TIMEOUT_MS, displayErrors: true },
-    );
-    delete ctx[IN_BODY_KEY];
-    delete ctx[IN_CTX_KEY];
+    });
+    let raw: unknown;
+    try {
+      raw = vm.runInContext(
+        `${INVOKE_KEY}(${JSON.stringify(localId)}, ${IN_BODY_KEY}, ${IN_CTX_KEY})`,
+        ctx,
+        { timeout: input.timeoutMs ?? DEFAULT_TIMEOUT_MS, displayErrors: true },
+      );
+    } finally {
+      delete ctx[IN_BODY_KEY];
+      delete ctx[IN_CTX_KEY];
+    }
     return normalizeResult(raw, input.contentType);
   } catch (e) {
     return { ok: false, error: (e as Error).message ?? String(e) };
@@ -149,12 +153,150 @@ export function ensurePluginsFolder(): string {
 // Internals
 // ─────────────────────────────────────────────────────────
 
+// Metadata only — the transform function itself stays inside the sandbox's
+// own registry and is only ever invoked through the in-context dispatcher.
 interface InternalTransformer {
   localId: string;
   name: string;
   description?: string;
   matchContentType?: string;
-  transform: (body: string, ctx: { contentType: string | null; headers: Record<string, string> }) => unknown;
+}
+
+// Everything the plugin can touch is created *inside* its vm context by this
+// script. The host only hands over `bridge`, a closure-held object whose
+// methods take and return primitives (strings/numbers), so plugin code never
+// gets a reference to a host-realm function or object — those would expose
+// the host `Function` constructor via `.constructor` and with it `process`,
+// `require`, fs and the network. Intrinsics (JSON, Math, Date, Promise, …)
+// are the context's own.
+const SANDBOX_SETUP = String.raw`
+(function (bridge, INVOKE_KEY) {
+  'use strict';
+  // Capture intrinsics now; plugin code may overwrite the globals later.
+  const U8 = Uint8Array;
+  const Str = String;
+  const fromCharCode = String.fromCharCode;
+  const JSONparse = JSON.parse;
+  const JSONstringify = JSON.stringify;
+  const MapCtor = Map;
+  const defineProperty = Object.defineProperty;
+  const freeze = Object.freeze;
+  const registry = new MapCtor();
+
+  const toStr = (v) => (typeof v === 'string' ? v : Str(v));
+  const safeJson = (a) => {
+    if (typeof a === 'string') return a;
+    try { const s = JSONstringify(a); return s === undefined ? Str(a) : s; } catch (e) { return Str(a); }
+  };
+  const fmt = (args) => { let out = ''; for (let i = 0; i < args.length; i++) out += (i ? ' ' : '') + safeJson(args[i]); return out; };
+
+  // bytes <-> "binary string" (one char per byte): the only shape that
+  // crosses the bridge, because strings are primitives.
+  const binStr = (bytes) => {
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 8192) s += fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    return s;
+  };
+  const fromBinStr = (s) => { const b = new U8(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255; return b; };
+  const bytesOf = (input, enc) => {
+    if (input instanceof U8) return input;
+    if (typeof input === 'string') return fromBinStr(bridge.encode(input, enc ? toStr(enc) : 'utf8'));
+    if (input && typeof input === 'object' && typeof input.length === 'number') return U8.from(input);
+    if (input && typeof input === 'object' && input.buffer instanceof ArrayBuffer) return new U8(input.buffer, input.byteOffset || 0, input.byteLength);
+    throw new TypeError('Unsupported input: expected a string, array or Uint8Array.');
+  };
+
+  // Minimal Buffer shim covering the documented usage
+  // (Buffer.from(x, enc).toString(enc), length, slice, iteration, toJSON).
+  class Buffer {
+    constructor(bytes) { this._bytes = bytes; }
+    static from(input, enc) { return new Buffer(bytesOf(input, enc)); }
+    static isBuffer(v) { return v instanceof Buffer; }
+    static byteLength(input, enc) { return bytesOf(input, enc).length; }
+    static concat(list) { let n = 0; for (const b of list) n += b.length; const out = new U8(n); let o = 0; for (const b of list) { out.set(b._bytes, o); o += b.length; } return new Buffer(out); }
+    get length() { return this._bytes.length; }
+    get byteLength() { return this._bytes.length; }
+    toString(enc) { return bridge.decode(binStr(this._bytes), enc ? toStr(enc) : 'utf8'); }
+    toJSON() { return { type: 'Buffer', data: Array.from(this._bytes) }; }
+    slice(a, b) { return new Buffer(this._bytes.slice(a, b)); }
+    subarray(a, b) { return new Buffer(this._bytes.subarray(a, b)); }
+    equals(o) { if (!(o instanceof Buffer) || o.length !== this.length) return false; for (let i = 0; i < this.length; i++) if (o._bytes[i] !== this._bytes[i]) return false; return true; }
+    [Symbol.iterator]() { return this._bytes[Symbol.iterator](); }
+  }
+  class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(s) { return bytesOf(toStr(s == null ? '' : s), 'utf8'); }
+  }
+  class TextDecoder {
+    constructor(label) { this.encoding = label ? toStr(label) : 'utf-8'; }
+    decode(input) { return bridge.decode(binStr(input == null ? new U8(0) : bytesOf(input)), this.encoding); }
+  }
+  const atob = (s) => bridge.encode(toStr(s), 'base64');
+  const btoa = (s) => bridge.decode(toStr(s), 'base64');
+
+  const mkLog = (level) => function () { bridge.log(level, fmt(arguments)); };
+  const console = freeze({ log: mkLog('log'), info: mkLog('log'), debug: mkLog('log'), warn: mkLog('warn'), error: mkLog('error') });
+
+  const volt = freeze({
+    plugin(info) {
+      if (!info || typeof info !== 'object') return;
+      bridge.setMeta(info.name != null ? toStr(info.name) : undefined, info.version != null ? toStr(info.version) : undefined);
+    },
+    transformer: freeze({
+      register(input) {
+        if (!input || typeof input !== 'object') throw new Error('register() requires an object.');
+        if (!input.id || typeof input.id !== 'string') throw new Error('register() requires a string id.');
+        if (typeof input.transform !== 'function') throw new Error('register() requires a transform function.');
+        registry.set(input.id, input.transform);
+        bridge.register(
+          input.id,
+          input.name != null ? toStr(input.name) : input.id,
+          input.description != null ? toStr(input.description) : undefined,
+          input.matchContentType != null ? toStr(input.matchContentType) : undefined,
+        );
+      },
+    }),
+    log: mkLog('log'),
+  });
+
+  // Host → sandbox dispatcher. Runs the transformer and normalises its
+  // result to a JSON string *here*, under the vm timeout, so a getter or a
+  // huge object can't stall the host once control returns.
+  const invoke = function (localId, body, ctxJson) {
+    const transform = registry.get(localId);
+    if (!transform) throw new Error('Transformer "' + localId + '" not registered.');
+    const r = transform(body, JSONparse(ctxJson));
+    if (r == null) return JSONstringify({ error: 'Transformer returned no value.' });
+    if (r && typeof r.then === 'function') return JSONstringify({ error: 'Transformers must be synchronous (a Promise was returned).' });
+    if (typeof r === 'string') return JSONstringify({ body: r });
+    if (typeof r === 'object') {
+      const b = r.body;
+      if (b === undefined) return JSONstringify({ error: 'Transformer returned an object without a "body".' });
+      const body = typeof b === 'string' ? b : (b instanceof Buffer ? b.toString('utf8') : JSONstringify(b));
+      const ct = typeof r.contentType === 'string' && r.contentType.length > 0 ? r.contentType : undefined;
+      return JSONstringify({ body: body === undefined ? '' : body, contentType: ct });
+    }
+    return JSONstringify({ error: 'Transformer returned an unsupported value type.' });
+  };
+
+  const expose = (name, value) => defineProperty(globalThis, name, { value, writable: true, configurable: true, enumerable: false });
+  expose('console', console);
+  expose('volt', volt);
+  expose('Buffer', Buffer);
+  expose('TextEncoder', TextEncoder);
+  expose('TextDecoder', TextDecoder);
+  expose('atob', atob);
+  expose('btoa', btoa);
+  // Not overridable: the host calls this by name after the plugin ran.
+  defineProperty(globalThis, INVOKE_KEY, { value: invoke, writable: false, configurable: false, enumerable: false });
+})
+`;
+
+const ENCODINGS = new Set<BufferEncoding>(['utf8', 'base64', 'base64url', 'hex', 'latin1', 'binary', 'ascii', 'utf16le', 'ucs2']);
+function normEncoding(enc: string): BufferEncoding {
+  const e = enc.toLowerCase().replace('-', '') as BufferEncoding;
+  if (!ENCODINGS.has(e)) throw new TypeError(`Unsupported encoding "${enc}".`);
+  return e;
 }
 
 function loadOne(id: string, filePath: string): PluginRuntime {
@@ -163,74 +305,36 @@ function loadOne(id: string, filePath: string): PluginRuntime {
     version: undefined as string | undefined,
   };
   const internalRegistry = new Map<string, InternalTransformer>();
+  const tag = `[plugin ${id}]`;
 
-  const console = {
-    log: (...args: unknown[]) => process.stdout.write(`[plugin ${id}] ${args.map(String).join(' ')}\n`),
-    warn: (...args: unknown[]) => process.stderr.write(`[plugin ${id}] ${args.map(String).join(' ')}\n`),
-    error: (...args: unknown[]) => process.stderr.write(`[plugin ${id}] ${args.map(String).join(' ')}\n`),
-  };
-
-  const sandbox: Record<string, unknown> = {
-    console,
-    JSON,
-    Date,
-    Math,
-    parseInt,
-    parseFloat,
-    isNaN,
-    isFinite,
-    encodeURIComponent,
-    decodeURIComponent,
-    URL,
-    URLSearchParams,
-    Buffer,
-    Promise,
-    Error,
-    TextEncoder,
-    TextDecoder,
-    atob: (s: string) => Buffer.from(s, 'base64').toString('binary'),
-    btoa: (s: string) => Buffer.from(s, 'binary').toString('base64'),
-  };
-
-  // The volt.* SDK exposed to plugins. Kept tiny and additive on purpose.
-  sandbox.volt = {
-    plugin(info: { name?: string; version?: string }) {
-      if (info?.name) meta.name = String(info.name);
-      if (info?.version) meta.version = String(info.version);
+  // Primitive-only bridge; see SANDBOX_SETUP.
+  const bridge = {
+    log(level: unknown, text: unknown) {
+      const line = `${tag} ${String(text)}\n`;
+      if (level === 'warn' || level === 'error') process.stderr.write(line);
+      else process.stdout.write(line);
     },
-    transformer: {
-      register(input: {
-        id: string;
-        name?: string;
-        description?: string;
-        matchContentType?: string;
-        transform: InternalTransformer['transform'];
-      }) {
-        if (!input || typeof input !== 'object') throw new Error('register() requires an object.');
-        if (!input.id || typeof input.id !== 'string') throw new Error('register() requires a string id.');
-        if (typeof input.transform !== 'function') throw new Error('register() requires a transform function.');
-        internalRegistry.set(input.id, {
-          localId: input.id,
-          name: input.name ?? input.id,
-          description: input.description,
-          matchContentType: input.matchContentType,
-          transform: input.transform,
-        });
-      },
+    setMeta(name: unknown, version: unknown) {
+      if (typeof name === 'string' && name) meta.name = name;
+      if (typeof version === 'string' && version) meta.version = version;
     },
-    log(...args: unknown[]) {
-      process.stdout.write(`[plugin ${id}] ${args.map(String).join(' ')}\n`);
+    register(localId: unknown, name: unknown, description: unknown, matchContentType: unknown) {
+      if (typeof localId !== 'string') return;
+      internalRegistry.set(localId, {
+        localId,
+        name: typeof name === 'string' ? name : localId,
+        description: typeof description === 'string' ? description : undefined,
+        matchContentType: typeof matchContentType === 'string' ? matchContentType : undefined,
+      });
     },
-  };
-
-  // Sandbox-owned dispatcher used by the host process to invoke transformers
-  // *inside* the vm context (so the function body executes with the plugin's
-  // globals + a vm timeout).
-  sandbox[REGISTRY_KEY] = internalRegistry;
-  sandbox[INVOKE_KEY] = function (localId: string, body: string, ctx: unknown) {
-    const t = internalRegistry.get(localId);
-    if (!t) throw new Error(`Transformer "${localId}" not registered.`);
-    return t.transform(body, ctx as { contentType: string | null; headers: Record<string, string> });
+    /** string in `enc` → binary string (one char per byte). */
+    encode(text: unknown, enc: unknown): string {
+      return Buffer.from(String(text), normEncoding(String(enc))).toString('latin1');
+    },
+    /** binary string → string in `enc`. */
+    decode(bin: unknown, enc: unknown): string {
+      return Buffer.from(String(bin), 'latin1').toString(normEncoding(String(enc)));
+    },
   };
 
   const info: PluginInfo = {
@@ -244,8 +348,17 @@ function loadOne(id: string, filePath: string): PluginRuntime {
 
   try {
     const code = fs.readFileSync(filePath, 'utf-8');
-    vm.createContext(sandbox);
-    vm.runInContext(code, sandbox, { timeout: DEFAULT_TIMEOUT_MS, displayErrors: true });
+    // Null prototype: the contextified object lives in the host realm, so a
+    // plain `{}` would expose host `Object` (and thus `Function`) through
+    // `this.constructor` at the top level of the plugin script.
+    const sandbox: Record<string, unknown> = Object.create(null);
+    vm.createContext(sandbox, { name: `volt-plugin:${id}` });
+    const install = vm.runInContext(SANDBOX_SETUP, sandbox, { timeout: DEFAULT_TIMEOUT_MS }) as (
+      b: typeof bridge,
+      key: string,
+    ) => void;
+    install(bridge, INVOKE_KEY);
+    vm.runInContext(code, sandbox, { timeout: DEFAULT_TIMEOUT_MS, displayErrors: true, filename: filePath });
     info.name = meta.name;
     info.version = meta.version;
     info.transformers = [...internalRegistry.values()].map((t) => ({
@@ -267,22 +380,23 @@ function normalizeResult(
   raw: unknown,
   inputContentType: string | null,
 ): ApplyTransformerResult {
-  if (raw == null) {
-    return { ok: false, error: 'Transformer returned no value.' };
+  // The sandbox dispatcher always returns a JSON string: {body, contentType?} | {error}.
+  if (typeof raw !== 'string') {
+    return { ok: false, error: 'Transformer dispatcher returned an unexpected value.' };
   }
-  if (typeof raw === 'string') {
-    return { ok: true, body: raw, contentType: inputContentType };
+  let parsed: { body?: unknown; contentType?: unknown; error?: unknown };
+  try {
+    parsed = JSON.parse(raw) as typeof parsed;
+  } catch {
+    return { ok: false, error: 'Transformer result could not be decoded.' };
   }
-  if (typeof raw === 'object') {
-    const obj = raw as { body?: unknown; contentType?: unknown };
-    const body = typeof obj.body === 'string' ? obj.body : JSON.stringify(obj.body);
-    const contentType =
-      typeof obj.contentType === 'string' && obj.contentType.length > 0
-        ? obj.contentType
-        : inputContentType;
-    return { ok: true, body, contentType };
-  }
-  return { ok: false, error: 'Transformer returned an unsupported value type.' };
+  if (typeof parsed.error === 'string') return { ok: false, error: parsed.error };
+  if (typeof parsed.body !== 'string') return { ok: false, error: 'Transformer returned no body.' };
+  const contentType =
+    typeof parsed.contentType === 'string' && parsed.contentType.length > 0
+      ? parsed.contentType
+      : inputContentType;
+  return { ok: true, body: parsed.body, contentType };
 }
 
 function ensureDirWithReadme(dir: string) {
@@ -329,12 +443,18 @@ volt.log('hello from the plugin');
 \`\`\`
 
 You can also return a plain string from \`transform\` — the response keeps
-the same content-type in that case.
+the same content-type in that case. \`transform\` must be synchronous.
+
+Available globals: the JavaScript built-ins (\`JSON\`, \`Math\`, \`Date\`, …),
+\`console\`, \`atob\` / \`btoa\`, \`TextEncoder\` / \`TextDecoder\`, and a small
+\`Buffer\` (\`Buffer.from(input, encoding)\`, \`.toString(encoding)\`, \`.length\`,
+\`.slice\`) supporting utf8, base64, base64url, hex, latin1 and utf16le.
 
 ## What plugins can't do (yet)
 
 - \`require\` / \`import\` (no node_modules access)
 - File system, network, or process access
+- Async work (\`transform\` must return synchronously)
 - Register UI panels — coming in a future build
 
 After editing a plugin file, click **Reload plugins** in the Plugins panel

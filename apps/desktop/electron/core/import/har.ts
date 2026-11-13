@@ -119,30 +119,53 @@ export function importHar(workspaceId: string, fileContent: string): {
     } catch {
       pathname = url.slice(0, 80);
     }
-    const name = `${req.method.toUpperCase()} ${pathname}`;
+    const name = `${(req.method ?? 'GET').toUpperCase()} ${pathname}`;
     const { bodyType, body } = mapBody(req);
     const headers = (req.headers ?? [])
       // HAR includes pseudo-headers (`:method`, `:authority`, etc.) on HTTP/2
       // entries — those aren't sendable, skip them.
-      .filter((h) => !h.name.startsWith(':'))
-      .map((h) => ({ key: h.name, value: h.value, enabled: true }));
-    const queryParams = (req.queryString ?? []).map((q) => ({
-      key: q.name,
+      .filter((h) => h && typeof h.name === 'string' && !h.name.startsWith(':'))
+      .map((h, j) => ({ id: rowId('h', j), key: h.name, value: h.value ?? '', enabled: true }));
+
+    // The URL in a HAR entry already carries the query string and
+    // `queryString[]` repeats it. Volt appends queryParams on send, so keep
+    // one copy: lift it into the Params table (editable) and strip the URL.
+    const qIdx = url.indexOf('?');
+    const hashIdx = url.indexOf('#');
+    const baseUrl = qIdx >= 0 ? url.slice(0, qIdx) + (hashIdx > qIdx ? url.slice(hashIdx) : '') : url;
+    const fromArray = (req.queryString ?? []).filter((q) => q && typeof q.name === 'string');
+    const pairs =
+      fromArray.length > 0
+        ? fromArray.map((q) => ({ key: q.name, value: q.value ?? '' }))
+        : qIdx >= 0
+          ? parseQueryPairs(url.slice(qIdx + 1, hashIdx > qIdx ? hashIdx : undefined))
+          : [];
+    const queryParams = pairs.map((q, j) => ({
+      id: rowId('q', j),
+      key: q.key,
       value: q.value,
       enabled: true,
     }));
+
+    // Bearer tokens are nicer to edit in the Auth tab than buried in headers.
+    let auth: unknown = { type: 'none' };
+    const authIdx = headers.findIndex((h) => h.key.toLowerCase() === 'authorization');
+    if (authIdx >= 0 && /^bearer\s+/i.test(headers[authIdx]!.value)) {
+      auth = { type: 'bearer', token: headers[authIdx]!.value.replace(/^bearer\s+/i, '') };
+      headers.splice(authIdx, 1);
+    }
 
     createRequest({
       workspaceId,
       collectionId: root!.id,
       name: name.length > 200 ? name.slice(0, 200) : name,
       method: normalizeMethod(req.method),
-      url,
+      url: baseUrl,
       headers,
       queryParams,
       bodyType,
       body,
-      auth: { type: 'none' },
+      auth,
       sortOrder: i,
     });
     summary.requests++;
@@ -207,14 +230,19 @@ function mapBody(req: HarRequest): { bodyType: string; body: unknown } {
     };
   }
 
-  // x-www-form-urlencoded — either params[] or text
+  // x-www-form-urlencoded — either params[] or text. Volt stores decoded
+  // key/value rows and re-encodes on send.
   if (mime === 'application/x-www-form-urlencoded') {
-    const content = post.text
-      ? post.text
-      : (post.params ?? [])
-          .map((p) => `${encodeURIComponent(p.name)}=${encodeURIComponent(p.value ?? '')}`)
-          .join('&');
-    return { bodyType: 'urlencoded', body: { type: 'urlencoded', content } };
+    const pairs = post.text
+      ? parseQueryPairs(post.text)
+      : (post.params ?? []).map((p) => ({ key: p.name, value: safeDecode(p.value ?? '') }));
+    return {
+      bodyType: 'urlencoded',
+      body: {
+        type: 'urlencoded',
+        fields: pairs.map((p, i) => ({ id: rowId('u', i), key: p.key, value: p.value, enabled: true })),
+      },
+    };
   }
 
   // Anything else with text → raw
@@ -227,6 +255,30 @@ function mapBody(req: HarRequest): { bodyType: string; body: unknown } {
   }
 
   return { bodyType: 'none', body: { type: 'none' } };
+}
+
+function rowId(prefix: string, i: number) {
+  return `${prefix}-${i}-${Math.random().toString(36).slice(2)}`;
+}
+
+function safeDecode(v: string): string {
+  try {
+    return decodeURIComponent(v.replace(/\+/g, ' '));
+  } catch {
+    return v;
+  }
+}
+
+function parseQueryPairs(s: string): Array<{ key: string; value: string }> {
+  return s
+    .split('&')
+    .filter((kv) => kv.length > 0)
+    .map((kv) => {
+      const eq = kv.indexOf('=');
+      return eq < 0
+        ? { key: safeDecode(kv), value: '' }
+        : { key: safeDecode(kv.slice(0, eq)), value: safeDecode(kv.slice(eq + 1)) };
+    });
 }
 
 function guessRawLanguage(mime: string): string {

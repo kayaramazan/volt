@@ -24,3 +24,13 @@ apps/desktop/release/
 
 # Prisma generated
 packages/db/generated/
+
+# Native widget build output (Xcode)
+apps/desktop/native/VoltWidget/build/
+xcuserdata/
+
+# Local agent tooling state
+.claude-flow/
+.swarm/
+agentdb.rvf*
+.claude/settings.local.json

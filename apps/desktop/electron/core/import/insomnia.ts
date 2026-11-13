@@ -9,7 +9,13 @@
 // Records are parented via `parentId`. We build a tree, then create
 // collections/requests/environments in the target workspace.
 
-import { createCollection, createEnvironment, createRequest } from '../db/queries';
+import {
+  createCollection,
+  createEnvironment,
+  createRequest,
+  updateCollection,
+  updateEnvironment,
+} from '../db/queries';
 import type { ImportSummary } from './postman';
 
 interface InsomniaExport {
@@ -35,6 +41,7 @@ interface InsomniaRequestGroup {
   _id: string;
   parentId: string;
   name: string;
+  description?: string;
   metaSortKey?: number;
 }
 
@@ -43,12 +50,16 @@ interface InsomniaRequest {
   _id: string;
   parentId: string;
   name: string;
+  description?: string;
   method?: string;
   url?: string;
   headers?: Array<{ name: string; value: string; disabled?: boolean }>;
   parameters?: Array<{ name: string; value: string; disabled?: boolean }>;
   body?: InsomniaBody;
   authentication?: InsomniaAuth;
+  // Insomnia 9+ scripts — they use Insomnia's `insomnia.*` API, which mirrors Postman's `pm.*`.
+  preRequestScript?: string;
+  afterResponseScript?: string;
   metaSortKey?: number;
 }
 
@@ -75,7 +86,7 @@ interface InsomniaEnvironment {
   _id: string;
   parentId: string;
   name: string;
-  data?: Record<string, string>;
+  data?: Record<string, unknown>;
 }
 
 export function importInsomnia(
@@ -112,6 +123,7 @@ export function importInsomnia(
       workspaceId,
       parentId: null,
       name: wsRes.name || 'Imported',
+      description: (wsRes as { description?: string }).description ?? '',
     });
     summary.collections++;
     rootCollectionId ??= rootColl!.id;
@@ -126,17 +138,39 @@ export function importInsomnia(
   const insomniaEnvs = parsed.resources.filter(
     (r): r is InsomniaEnvironment => r._type === 'environment',
   );
+  // Insomnia has a "Base Environment" per workspace with sub-environments
+  // parented to it that override its values. Volt environments are flat, so
+  // each sub-environment is imported merged over its base.
+  const envById = new Map(insomniaEnvs.map((e) => [e._id, e] as const));
+  const isBase = (e: InsomniaEnvironment) => !envById.has(e.parentId);
+  const subEnvs = insomniaEnvs.filter((e) => !isBase(e));
   for (const e of insomniaEnvs) {
-    createEnvironment({ workspaceId, name: e.name || 'Imported Environment' });
+    if (isBase(e) && subEnvs.some((s) => s.parentId === e._id)) continue; // folded into its children
+    const merged: Record<string, unknown> = {};
+    const chain: InsomniaEnvironment[] = [];
+    for (let cur: InsomniaEnvironment | undefined = e; cur; cur = envById.get(cur.parentId)) chain.unshift(cur);
+    for (const c of chain) Object.assign(merged, c.data ?? {});
+    const created = createEnvironment({ workspaceId, name: e.name || 'Imported Environment' });
+    updateEnvironment(created!.id, {
+      variables: Object.entries(merged).map(([key, value]) => ({
+        key,
+        value: typeof value === 'string' ? convertTemplates(value) : JSON.stringify(value),
+        secretRef: null,
+      })),
+    });
     summary.environments++;
-    if (e.data && Object.keys(e.data).length > 0) {
-      summary.warnings.push(
-        `Environment "${e.name}" has ${Object.keys(e.data).length} variables — re-enter sensitive values.`,
-      );
-    }
   }
 
   return { success: true, summary, rootCollectionId };
+}
+
+/** Insomnia templates `{{ _.name }}` → Volt `{{name}}`. */
+function convertTemplates(s: string): string {
+  return s.replace(/\{\{\s*_\.([\w.-]+)\s*\}\}/g, '{{$1}}');
+}
+
+function rowId(prefix: string, i: number) {
+  return `${prefix}-${i}-${Math.random().toString(36).slice(2)}`;
 }
 
 function importChildren(
@@ -155,121 +189,202 @@ function importChildren(
       return sa - sb;
     });
 
+  let folderIndex = 0;
+  let requestIndex = 0;
   for (const child of children) {
     if (child._type === 'request_group') {
       const folder = createCollection({
         workspaceId,
         parentId: parentCollectionId,
         name: child.name || 'Untitled Folder',
+        description: child.description ?? '',
       });
+      updateCollection(folder!.id, { sortOrder: folderIndex++ });
       summary.collections++;
       importChildren(resources, child._id, workspaceId, folder!.id, summary);
     } else if (child._type === 'request') {
-      importRequest(child, workspaceId, parentCollectionId, summary);
+      importRequest(child, workspaceId, parentCollectionId, requestIndex++, summary);
     }
   }
 }
+
+const ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS'];
 
 function importRequest(
   r: InsomniaRequest,
   workspaceId: string,
   parentCollectionId: string,
+  sortOrder: number,
   summary: ImportSummary,
 ) {
-  const headers = (r.headers ?? []).map((h, i) => ({
-    id: `h-${i}-${Math.random().toString(36).slice(2)}`,
-    key: h.name,
-    value: h.value,
-    enabled: h.disabled !== true,
-  }));
+  const headers = (r.headers ?? [])
+    .filter((h) => h && typeof h.name === 'string')
+    .map((h, i) => ({
+      id: rowId('h', i),
+      key: h.name,
+      value: convertTemplates(h.value ?? ''),
+      enabled: h.disabled !== true,
+    }));
 
-  const queryParams = (r.parameters ?? []).map((p, i) => ({
-    id: `q-${i}-${Math.random().toString(36).slice(2)}`,
-    key: p.name,
-    value: p.value,
-    enabled: p.disabled !== true,
-  }));
+  // Insomnia keeps `?a=1` inside `url` and ALSO lists params in `parameters`.
+  // Volt appends queryParams on send, so lift the inline query into the table.
+  const rawUrl = convertTemplates(r.url ?? '');
+  const qIdx = rawUrl.indexOf('?');
+  const url = qIdx >= 0 ? rawUrl.slice(0, qIdx) : rawUrl;
+  const inline =
+    qIdx >= 0
+      ? rawUrl
+          .slice(qIdx + 1)
+          .split('&')
+          .filter(Boolean)
+          .map((kv) => {
+            const eq = kv.indexOf('=');
+            const dec = (v: string) => {
+              try {
+                return decodeURIComponent(v.replace(/\+/g, ' '));
+              } catch {
+                return v;
+              }
+            };
+            return eq < 0 ? { name: dec(kv), value: '' } : { name: dec(kv.slice(0, eq)), value: dec(kv.slice(eq + 1)) };
+          })
+      : [];
+  const queryParams = [...inline, ...(r.parameters ?? []).filter((p) => p && typeof p.name === 'string')].map(
+    (p, i) => ({
+      id: rowId('q', i),
+      key: p.name,
+      value: convertTemplates(p.value ?? ''),
+      enabled: (p as { disabled?: boolean }).disabled !== true,
+    }),
+  );
 
   const { bodyType, body } = mapBody(r.body);
   const auth = mapAuth(r.authentication);
+
+  let method = (r.method ?? 'GET').toUpperCase();
+  if (!ALLOWED_METHODS.includes(method)) {
+    summary.warnings.push(`"${r.name}": method ${method} is not supported — imported as GET.`);
+    method = 'GET';
+  }
 
   createRequest({
     workspaceId,
     collectionId: parentCollectionId,
     name: r.name || 'Untitled Request',
-    method: (r.method ?? 'GET').toUpperCase(),
-    url: r.url ?? '',
+    method,
+    url,
     headers,
     queryParams,
     bodyType,
     body,
     auth,
+    // Insomnia's `insomnia.*` script object is API-compatible with `pm.*`; alias it so scripts run unchanged.
+    preRequestScript: insomniaScript(r.preRequestScript),
+    postResponseScript: insomniaScript(r.afterResponseScript),
+    description: r.description ?? '',
+    sortOrder,
   });
   summary.requests++;
 }
 
-function mapBody(b?: InsomniaBody): { bodyType: string; body: unknown } {
-  if (!b || !b.mimeType) return { bodyType: 'none', body: { type: 'none' } };
+function insomniaScript(s?: string): string {
+  if (!s || !s.trim()) return '';
+  return /\binsomnia\./.test(s) && !/\bconst insomnia\b/.test(s) ? `const insomnia = pm;\n${s}` : s;
+}
 
-  if (b.mimeType.includes('json') || b.mimeType === 'text/plain' || b.mimeType === 'text/xml') {
-    const lang = b.mimeType.includes('json')
-      ? 'json'
-      : b.mimeType.includes('xml')
-        ? 'xml'
-        : 'text';
-    return {
-      bodyType: 'raw',
-      body: { type: 'raw', language: lang, content: b.text ?? '' },
-    };
+function mapBody(b?: InsomniaBody): { bodyType: string; body: unknown } {
+  const none = { bodyType: 'none', body: { type: 'none' } };
+  if (!b || typeof b !== 'object') return none;
+  const mime = (b.mimeType ?? '').toLowerCase().split(';')[0]!.trim();
+
+  if (mime === 'application/graphql' || mime === 'application/graphql+json') {
+    // Insomnia stores the GraphQL body as a JSON envelope: {"query": "...", "variables": {...}}
+    let query = b.text ?? '';
+    let variables = '';
+    try {
+      const env = JSON.parse(b.text ?? '') as { query?: string; variables?: unknown };
+      if (typeof env.query === 'string') {
+        query = env.query;
+        variables =
+          env.variables == null ? '' : typeof env.variables === 'string' ? env.variables : JSON.stringify(env.variables, null, 2);
+      }
+    } catch {
+      /* raw query text */
+    }
+    return { bodyType: 'graphql', body: { type: 'graphql', query: convertTemplates(query), variables: convertTemplates(variables) } };
   }
-  if (b.mimeType === 'application/x-www-form-urlencoded') {
+  if (mime === 'application/x-www-form-urlencoded') {
     return {
       bodyType: 'urlencoded',
       body: {
         type: 'urlencoded',
-        fields: (b.params ?? []).map((p, i) => ({
-          id: `u-${i}-${Math.random().toString(36).slice(2)}`,
-          key: p.name,
-          value: p.value,
-          enabled: p.disabled !== true,
-        })),
+        fields: (b.params ?? [])
+          .filter((p) => p && typeof p.name === 'string')
+          .map((p, i) => ({
+            id: rowId('u', i),
+            key: p.name,
+            value: convertTemplates(p.value ?? ''),
+            enabled: p.disabled !== true,
+          })),
       },
     };
   }
-  if (b.mimeType === 'multipart/form-data') {
+  if (mime === 'multipart/form-data') {
     return {
       bodyType: 'form',
       body: {
         type: 'form',
-        fields: (b.params ?? []).map((p, i) => ({
-          id: `f-${i}-${Math.random().toString(36).slice(2)}`,
-          key: p.name,
-          kind: p.type === 'file' ? ('file' as const) : ('text' as const),
-          value: p.type === 'file' ? p.fileName ?? '' : p.value,
-          enabled: p.disabled !== true,
-        })),
+        fields: (b.params ?? [])
+          .filter((p) => p && typeof p.name === 'string')
+          .map((p, i) => ({
+            id: rowId('f', i),
+            key: p.name,
+            kind: p.type === 'file' ? ('file' as const) : ('text' as const),
+            value: p.type === 'file' ? (p.fileName ?? '') : convertTemplates(p.value ?? ''),
+            enabled: p.disabled !== true,
+          })),
       },
     };
   }
-  if (b.fileName) {
-    return { bodyType: 'binary', body: { type: 'binary', filePath: b.fileName } };
+  if (mime === 'application/octet-stream' || (b.fileName && b.text == null)) {
+    return { bodyType: 'binary', body: { type: 'binary', filePath: b.fileName ?? '' } };
   }
-  return { bodyType: 'none', body: { type: 'none' } };
+  if (typeof b.text === 'string' && (mime || b.text.length > 0)) {
+    const lang = /json/.test(mime)
+      ? 'json'
+      : /xml/.test(mime)
+        ? 'xml'
+        : /html/.test(mime)
+          ? 'html'
+          : /javascript|ecmascript/.test(mime)
+            ? 'javascript'
+            : 'text';
+    return {
+      bodyType: 'raw',
+      body: { type: 'raw', language: lang, content: convertTemplates(b.text) },
+    };
+  }
+  return none;
 }
 
 function mapAuth(a?: InsomniaAuth): unknown {
   if (!a || !a.type || a.type === 'none' || a.disabled) return { type: 'none' };
   switch (a.type) {
     case 'bearer':
-      return { type: 'bearer', token: a.token ?? '' };
+      return { type: 'bearer', token: convertTemplates(a.token ?? '') };
     case 'basic':
-      return { type: 'basic', username: a.username ?? '', password: a.password ?? '' };
+      return {
+        type: 'basic',
+        username: convertTemplates(a.username ?? ''),
+        password: convertTemplates(a.password ?? ''),
+      };
     case 'apikey':
       return {
         type: 'apiKey',
-        key: a.key ?? '',
-        value: a.value ?? '',
-        placement: (a.addTo === 'query' ? 'query' : 'header') as 'header' | 'query',
+        key: convertTemplates(a.key ?? ''),
+        value: convertTemplates(a.value ?? ''),
+        // Insomnia writes `queryParams`; older exports used `query`.
+        placement: (a.addTo === 'queryParams' || a.addTo === 'query' ? 'query' : 'header') as 'header' | 'query',
       };
     default:
       return { type: 'none' };

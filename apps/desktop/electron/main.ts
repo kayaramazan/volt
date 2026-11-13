@@ -17,12 +17,20 @@ import { registerIpcHandlers } from './ipc/handlers';
 import { bootMockServer } from './core/mock/server';
 import { loadAllPlugins } from './core/plugins/runtime';
 import { startSync, stopSync } from './core/sync/engine';
+import { handleVoltUrl, initWidgetBridge } from './core/widget/bridge';
 
 const isDev = !app.isPackaged;
 const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 
 // Performance: enable V8 cache for renderer code (faster cold start).
 app.commandLine.appendSwitch('disk-cache-size', '52428800'); // 50 MB
+
+// Optional data-folder override (e.g. run a dev build next to the installed
+// app without fighting over the single-instance lock or the same SQLite DB).
+// Must run before the lock and before anything reads app.getPath('userData').
+if (process.env.VOLT_USER_DATA_DIR) {
+  app.setPath('userData', process.env.VOLT_USER_DATA_DIR);
+}
 
 // Single-instance lock — second launch focuses existing window instead of duplicating.
 const gotTheLock = app.requestSingleInstanceLock();
@@ -33,12 +41,40 @@ if (!gotTheLock) {
 
 let mainWindow: BrowserWindow | null = null;
 
+// volt:// deep links (desktop widget). macOS delivers them via open-url, which
+// can fire before the app is ready (when the link launched Volt), so queue
+// them until the widget bridge is up.
+let widgetBridgeReady = false;
+const pendingUrls: string[] = [];
+app.on('open-url', (event, url) => {
+  event.preventDefault();
+  if (widgetBridgeReady) handleVoltUrl(url);
+  else pendingUrls.push(url);
+});
+if (app.isPackaged && !app.isDefaultProtocolClient('volt')) {
+  app.setAsDefaultProtocolClient('volt');
+}
+
 app.on('second-instance', () => {
   if (mainWindow) {
     if (mainWindow.isMinimized()) mainWindow.restore();
     mainWindow.focus();
   }
 });
+
+// Dev builds run the stock Electron binary, so the dock/taskbar shows the
+// Electron logo. Use the Volt icon there too; packaged builds get it from the
+// bundle (build/icon.icns / icon.png via electron-builder).
+const DEV_ICON_PATH = path.join(__dirname, '../build/icon.png');
+if (!app.isPackaged && process.platform === 'darwin') {
+  app.whenReady().then(() => {
+    try {
+      app.dock?.setIcon(DEV_ICON_PATH);
+    } catch {
+      /* icon missing in a partial checkout — keep the default */
+    }
+  });
+}
 
 // macOS: re-create window when clicking dock icon if no windows open.
 app.on('activate', () => {
@@ -89,6 +125,13 @@ app.whenReady().then(async () => {
 
   createMainWindow();
 
+  void initWidgetBridge({
+    getWindow: () => mainWindow ?? createMainWindow(),
+  }).then(() => {
+    widgetBridgeReady = true;
+    for (const url of pendingUrls.splice(0)) handleVoltUrl(url);
+  });
+
   // Sync starts 2s after window so UI is responsive first.
   setTimeout(() => {
     startSync();
@@ -111,13 +154,15 @@ app.whenReady().then(async () => {
   }
 });
 
-function createMainWindow() {
-  mainWindow = new BrowserWindow({
+function createMainWindow(): BrowserWindow {
+  const win = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 900,
     minHeight: 600,
     title: 'Volt',
+    // Window/taskbar icon on Windows/Linux in dev (packaged builds embed it).
+    ...(!app.isPackaged && process.platform !== 'darwin' ? { icon: DEV_ICON_PATH } : {}),
     backgroundColor: '#0a0a0a',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     show: false, // wait for ready-to-show to avoid flicker
@@ -131,6 +176,7 @@ function createMainWindow() {
       // Allow CodeMirror to use eval-free editor (no unsafe-eval needed in prod CSP)
     },
   });
+  mainWindow = win;
 
   // Install a custom menu so we can override Cmd/Ctrl+W to close the active
   // tab instead of the window. We also wire Cmd/Ctrl+Shift+W to "Close window"
@@ -149,8 +195,8 @@ function createMainWindow() {
     mainWindow?.show();
   });
 
-  mainWindow.on('closed', () => {
-    mainWindow = null;
+  win.on('closed', () => {
+    if (mainWindow === win) mainWindow = null;
   });
 
   // Open external links in OS browser, not new Electron windows.
@@ -169,6 +215,8 @@ function createMainWindow() {
       event.preventDefault();
     }
   });
+
+  return win;
 }
 
 /**

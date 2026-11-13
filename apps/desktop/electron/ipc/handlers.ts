@@ -22,11 +22,13 @@ import {
   createWorkspace,
   deleteGlobal,
   deleteWorkspaceLocal,
+  duplicateCollection,
   getActiveEnvironment,
   getAutoHeaders,
   getEnvironment,
   getHistoryEntry,
   getRequest,
+  getWorkspace,
   listCollections,
   listEnvironments,
   listGlobals,
@@ -53,6 +55,15 @@ import { getDbPath } from '../core/db/connection';
 import { getSecret } from '../core/auth/keychain';
 import { authedFetch, currentUser, login as authLogin, logout as authLogout, register as authRegister } from '../core/auth/manager';
 import { executeRequest, cancelRequest } from '../core/http/engine';
+import {
+  completeWidgetRun,
+  getWidgetFavorites,
+  isWidgetSupported,
+  markRendererReady,
+  recordWidgetResult,
+  scheduleSnapshot,
+  setWidgetFavorite,
+} from '../core/widget/bridge';
 import { wsClose, wsOpen, wsSend } from '../core/http/ws';
 import {
   invokeUnary,
@@ -80,9 +91,10 @@ import {
   runPreRequest,
   type ScriptRequestView,
   type ScriptResponseView,
+  type ScriptTestResult,
 } from '../core/scripts/runner';
 import { resolveRequest } from '../core/http/resolve';
-import { forceSync, getSyncStatus, notifyDirty, startSync, stopSync } from '../core/sync/engine';
+import { forceSync, getSyncStatus, notifyDirty, startSync, stopSync, refreshRemoteWorkspaces } from '../core/sync/engine';
 import { importPostman } from '../core/import/postman';
 import { importInsomnia } from '../core/import/insomnia';
 import { importOpenAPI } from '../core/import/openapi';
@@ -93,18 +105,28 @@ import { exportInsomnia } from '../core/export/insomnia';
 import { exportOpenAPI } from '../core/export/openapi';
 import { exportDocs } from '../core/export/docs';
 
+const WIDGET_SNAPSHOT_CHANNELS =
+  /^(apiRequest:(update|delete)|collection:(update|delete)|workspace:(rename|delete)|env:(setActive|update|delete))$/;
+
 export function registerIpcHandlers() {
   // Generic handler wrapper: validates input via contract, catches errors.
   for (const channel of Object.keys(IPC) as IpcChannel[]) {
-    ipcMain.handle(channel, async (_event, rawInput) => {
+    ipcMain.handle(channel, async (event, rawInput) => {
       const contract = IPC[channel];
-      console.log(`[ipc] <- ${channel}`, rawInput);
+      // Log the channel only: inputs carry passwords, tokens, client
+      // secrets and request bodies, which must never reach the console/logs.
+      console.log(`[ipc] <- ${channel}`);
       try {
         // Renderer may invoke no-arg channels as `volt['auth:status']()`,
         // which arrives here as `undefined`. Treat that as `{}` so empty-object
         // schemas don't reject it.
         const parsed = contract.input.parse(rawInput ?? {});
+        // The widget bridge needs to know which renderer to send runs to.
+        if (channel === 'widget:ready') markRendererReady(event.sender);
         const result = await dispatch(channel, parsed as never);
+        // Names, methods, collections or the active env may have changed —
+        // refresh the desktop widget (debounced, no-op when unchanged).
+        if (WIDGET_SNAPSHOT_CHANNELS.test(channel)) scheduleSnapshot();
         return result;
       } catch (err) {
         if (err instanceof z.ZodError) {
@@ -133,6 +155,8 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         postResponseScript,
         variables,
         environmentId,
+        requestName,
+        requestId,
       } = input as {
         inFlightId: string;
         request: any;
@@ -141,11 +165,14 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         variables?: Record<string, string>;
         workspaceId?: string;
         environmentId?: string | null;
+        requestName?: string;
+        requestId?: string | null;
       };
+      const scriptOptions = { requestName, requestId };
 
       const varMap = new Map<string, string>(Object.entries(variables ?? {}));
-      let preScriptOutput: { logs: string[]; error: string | null } | undefined;
-      let postScriptOutput: { logs: string[]; error: string | null } | undefined;
+      let preScriptOutput: ScriptOutputView | undefined;
+      let postScriptOutput: ScriptOutputView | undefined;
 
       // Build env context for script `volt.environment.*` access. Read on every
       // script run so the latest value (e.g. one a previous post-script wrote)
@@ -156,9 +183,10 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         if (!env) return null;
         return {
           name: env.name,
+          // Full rows: the runner skips `enabled: false` vars in pm.environment.get
+          // and carries the other flags through to write-back.
           variables: (env.variables as Array<{ key: string; value: string }>).map((v) => ({
-            key: v.key,
-            value: v.value,
+            ...v,
           })),
         };
       }
@@ -168,18 +196,16 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       if (preRequestScript && preRequestScript.trim()) {
         const view = toScriptRequestView(request);
         const envCtx = loadEnvCtx();
-        const result = runPreRequest(preRequestScript, view, varMap, envCtx);
-        preScriptOutput = { logs: result.logs, error: result.error };
+        const result = await runPreRequest(preRequestScript, view, varMap, envCtx, scriptOptions);
+        preScriptOutput = { logs: result.logs, error: result.error, tests: result.tests };
         if (result.envMutations && environmentId) {
           await updateEnvironment(environmentId, {
-            variables: result.envMutations.finalVars.map((v) => ({
-              ...v,
-              secretRef: null,
-            })),
+            variables: mergeScriptEnvVars(environmentId, result.envMutations.finalVars),
           });
           notifyDirty();
         }
         if (!result.ok) {
+          recordWidgetResult(requestId, { ok: false, errorMessage: `Pre-request script failed` });
           return {
             ok: false as const,
             errorCode: 'PRE_SCRIPT_ERROR',
@@ -198,20 +224,18 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         const view = toScriptRequestView(request);
         const responseView = toScriptResponseView(output);
         const envCtx = loadEnvCtx();
-        const result = runPostResponse(
+        const result = await runPostResponse(
           postResponseScript,
           view,
           responseView,
           varMap,
           envCtx,
+          scriptOptions,
         );
-        postScriptOutput = { logs: result.logs, error: result.error };
+        postScriptOutput = { logs: result.logs, error: result.error, tests: result.tests };
         if (result.envMutations && environmentId) {
           await updateEnvironment(environmentId, {
-            variables: result.envMutations.finalVars.map((v) => ({
-              ...v,
-              secretRef: null,
-            })),
+            variables: mergeScriptEnvVars(environmentId, result.envMutations.finalVars),
           });
           notifyDirty();
         }
@@ -219,11 +243,15 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
 
       // Record in history (best-effort; failure doesn't fail the request)
       try {
-        const workspaceId = guessActiveWorkspace();
+        // Prefer the workspace the renderer sent; guessActiveWorkspace() is
+        // only a fallback for old callers (it picks the first workspace in
+        // the DB, which is wrong as soon as there's more than one).
+        const sent = input as { workspaceId?: string; requestId?: string | null };
+        const workspaceId = sent.workspaceId ?? guessActiveWorkspace();
         if (workspaceId) {
           recordHistory({
             workspaceId,
-            requestId: null,
+            requestId: sent.requestId ?? null,
             method: request.method,
             url: request.url,
             requestSnapshot: request,
@@ -244,19 +272,25 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         console.error('history record failed:', e);
       }
 
+      recordWidgetResult(requestId, output);
       return { ...output, preScript: preScriptOutput, postScript: postScriptOutput };
     }
     case 'ws:open': {
-      const { url } = input as { url: string };
-      return wsOpen(url);
+      // headers/protocols are forwarded when the contract carries them.
+      const { url, headers, protocols } = input as {
+        url: string;
+        headers?: Record<string, string>;
+        protocols?: string[];
+      };
+      return wsOpen(url, { headers, protocols });
     }
     case 'ws:send': {
       const { connectionId, text } = input as { connectionId: string; text: string };
       return wsSend(connectionId, text);
     }
     case 'ws:close': {
-      const { connectionId } = input as { connectionId: string };
-      return wsClose(connectionId);
+      const { connectionId, code, reason } = input as { connectionId: string; code?: number; reason?: string };
+      return wsClose(connectionId, code, reason);
     }
     case 'grpc:loadProto': {
       const { protoPath } = input as { protoPath: string };
@@ -386,20 +420,35 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       const created = (await teamApi('POST', '/api/workspaces', { id, name, teamId })) as {
         id: string;
       };
-      return createWorkspace({
+      const ws = createWorkspace({
         id: created.id,
         name,
         localOnly: false,
         ownerUserId: user.id,
         ownerTeamId: teamId ?? null,
       });
+      // Open its live stream and record it as known for this account.
+      void refreshRemoteWorkspaces().catch(() => undefined);
+      return ws;
     }
     case 'workspace:rename': {
       const { id, name } = input as { id: string; name: string };
+      const ws = getWorkspace(id);
+      // Cloud workspace: rename on the server first so teammates get it; a
+      // failure surfaces to the renderer instead of diverging silently.
+      if (ws && !ws.localOnly && currentUser()) {
+        await teamApi('PATCH', `/api/workspaces/${id}`, { name });
+      }
       return renameWorkspace(id, name);
     }
     case 'workspace:delete': {
       const { id } = input as { id: string };
+      const ws = getWorkspace(id);
+      if (ws && !ws.localOnly && currentUser()) {
+        // Server-side soft delete (30-day recovery); teammates drop it on
+        // their next workspace refresh.
+        await teamApi('DELETE', `/api/workspaces/${id}`);
+      }
       deleteWorkspaceLocal(id);
       return { deleted: true };
     }
@@ -409,8 +458,18 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       const { workspaceId } = input as { workspaceId: string };
       return listCollections(workspaceId);
     }
-    case 'collection:create':
-      return createCollection(input as any);
+    case 'collection:create': {
+      const result = createCollection(input as any);
+      notifyDirty();
+      return result;
+    }
+    case 'collection:duplicate': {
+      const { id } = input as { id: string };
+      const result = duplicateCollection(id);
+      if (!result) throw new Error('Collection not found');
+      notifyDirty();
+      return result;
+    }
     case 'collection:update': {
       const { id, ...patch } = input as any;
       const result = updateCollection(id, patch);
@@ -467,8 +526,11 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
     }
     case 'apiRequest:get':
       return getRequest((input as { id: string }).id);
-    case 'apiRequest:create':
-      return createRequest(input as any);
+    case 'apiRequest:create': {
+      const result = createRequest(input as any);
+      notifyDirty();
+      return result;
+    }
     case 'apiRequest:update': {
       const { id, ...patch } = input as any;
       const result = updateRequest(id, patch);
@@ -485,8 +547,11 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
     // ──── Environments
     case 'env:list':
       return listEnvironments((input as { workspaceId: string }).workspaceId);
-    case 'env:create':
-      return createEnvironment(input as any);
+    case 'env:create': {
+      const created = createEnvironment(input as any);
+      notifyDirty();
+      return created;
+    }
     case 'env:update': {
       const { id, ...patch } = input as any;
       const result = updateEnvironment(id, patch);
@@ -495,6 +560,11 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
     }
     case 'env:delete': {
       const { id } = input as { id: string };
+      // Don't leave a dangling active-environment pointer behind.
+      const doomed = getEnvironment(id);
+      if (doomed && getActiveEnvironment(doomed.workspaceId) === id) {
+        setActiveEnvironment(doomed.workspaceId, null);
+      }
       softDeleteEnvironment(id);
       notifyDirty();
       return { deleted: true };
@@ -617,7 +687,10 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
     }
     case 'team:acceptInvite': {
       const { code } = input as { code: string };
-      return teamApi('POST', `/api/teams/invite/${encodeURIComponent(code)}/accept`);
+      const accepted = await teamApi('POST', `/api/teams/invite/${encodeURIComponent(code)}/accept`);
+      // Pull in the team's workspaces right away instead of on the next tick.
+      await refreshRemoteWorkspaces().catch((e) => console.warn('[sync] refresh after invite failed:', (e as Error).message));
+      return accepted;
     }
     case 'team:billing': {
       const { teamId } = input as { teamId: string };
@@ -663,7 +736,15 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       const cfg = input as Parameters<typeof ensureToken>[0];
       try {
         const t = await ensureToken(cfg);
-        if (!t) return { ok: false, error: 'No token; complete the auth-code flow first.' };
+        if (!t) {
+          return {
+            ok: false,
+            error:
+              cfg.grant === 'authorization_code'
+                ? 'No OAuth token cached (or it expired and could not be refreshed). Open the Auth tab and complete the authorization code flow.'
+                : 'OAuth token request returned no token.',
+          };
+        }
         return {
           ok: true,
           accessToken: t.accessToken,
@@ -820,6 +901,21 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       }
     }
 
+    // ──── Desktop widget
+    case 'widget:favorites':
+      return { requestIds: getWidgetFavorites(), supported: isWidgetSupported() };
+    case 'widget:setFavorite': {
+      const { requestId, favorite } = input as { requestId: string; favorite: boolean };
+      return { requestIds: setWidgetFavorite(requestId, favorite) };
+    }
+    case 'widget:ready':
+      return { ok: true };
+    case 'widget:runResult': {
+      const { runId, ok, error } = input as { runId: string; ok: boolean; error?: string };
+      completeWidgetRun(runId, { ok, error });
+      return { ok: true };
+    }
+
     default:
       throw new Error(`Unknown IPC channel: ${channel}`);
   }
@@ -835,67 +931,106 @@ function runImport(args: {
   filePath?: string;
   content?: string;
 }) {
+  const emptySummary = { collections: 0, requests: 0, environments: 0, warnings: [] };
+
+  // Guard against stale workspaceIds (workspace deleted locally or via sync
+  // while the renderer still holds the id). Without this the SQLite insert
+  // bubbles up as a raw "FOREIGN KEY constraint failed" through the IPC.
+  if (!getWorkspace(args.workspaceId)) {
+    return {
+      success: false,
+      summary: emptySummary,
+      errorMessage:
+        'Selected workspace no longer exists. Pick a workspace from the sidebar and try again.',
+    };
+  }
+
   let content = args.content;
   if (!content && args.filePath) {
-    content = fs.readFileSync(args.filePath, 'utf-8');
+    try {
+      content = fs.readFileSync(args.filePath, 'utf-8');
+    } catch (e) {
+      return {
+        success: false,
+        summary: emptySummary,
+        errorMessage: `Couldn't read file: ${(e as Error).message}`,
+      };
+    }
   }
   if (!content) {
     return {
       success: false,
-      summary: { collections: 0, requests: 0, environments: 0, warnings: [] },
+      summary: emptySummary,
       errorMessage: 'No content or file provided.',
     };
   }
 
-  switch (args.source) {
-    case 'postman': {
-      const r = importPostman(args.workspaceId, content);
-      return {
-        success: r.success,
-        collectionId: r.rootCollectionId,
-        summary: r.summary,
-        errorMessage: r.error,
-      };
+  try {
+    switch (args.source) {
+      case 'postman': {
+        const r = importPostman(args.workspaceId, content);
+        return {
+          success: r.success,
+          collectionId: r.rootCollectionId,
+          summary: r.summary,
+          errorMessage: r.error,
+        };
+      }
+      case 'insomnia': {
+        const r = importInsomnia(args.workspaceId, content);
+        return {
+          success: r.success,
+          collectionId: r.rootCollectionId,
+          summary: r.summary,
+          errorMessage: r.error,
+        };
+      }
+      case 'openapi': {
+        const ext = args.filePath?.toLowerCase().endsWith('.yaml') || args.filePath?.toLowerCase().endsWith('.yml')
+          ? 'yaml'
+          : 'json';
+        const r = importOpenAPI(args.workspaceId, content, ext);
+        return {
+          success: r.success,
+          collectionId: r.rootCollectionId,
+          summary: r.summary,
+          errorMessage: r.error,
+        };
+      }
+      case 'curl': {
+        const r = importCurl(args.workspaceId, null, content);
+        return {
+          success: r.success,
+          requestId: r.requestId,
+          summary: r.summary,
+          errorMessage: r.error,
+        };
+      }
+      case 'har': {
+        const r = importHar(args.workspaceId, content);
+        return {
+          success: r.success,
+          collectionId: r.rootCollectionId,
+          summary: r.summary,
+          errorMessage: r.error,
+        };
+      }
     }
-    case 'insomnia': {
-      const r = importInsomnia(args.workspaceId, content);
-      return {
-        success: r.success,
-        collectionId: r.rootCollectionId,
-        summary: r.summary,
-        errorMessage: r.error,
-      };
-    }
-    case 'openapi': {
-      const ext = args.filePath?.toLowerCase().endsWith('.yaml') || args.filePath?.toLowerCase().endsWith('.yml')
-        ? 'yaml'
-        : 'json';
-      const r = importOpenAPI(args.workspaceId, content, ext);
-      return {
-        success: r.success,
-        collectionId: r.rootCollectionId,
-        summary: r.summary,
-        errorMessage: r.error,
-      };
-    }
-    case 'curl': {
-      const r = importCurl(args.workspaceId, null, content);
-      return {
-        success: r.success,
-        requestId: r.requestId,
-        summary: r.summary,
-        errorMessage: r.error,
-      };
-    }
-    case 'har': {
-      const r = importHar(args.workspaceId, content);
-      return {
-        success: r.success,
-        collectionId: r.rootCollectionId,
-        summary: r.summary,
-        errorMessage: r.error,
-      };
-    }
+  } catch (e) {
+    const err = e as Error & { code?: string };
+    // FK failures are almost always a workspace race (deleted between the
+    // up-front check and the inserts). Surface a friendly message instead of
+    // the raw SqliteError that the renderer would otherwise show.
+    const isFkFail =
+      err.code === 'SQLITE_CONSTRAINT_FOREIGNKEY' ||
+      /FOREIGN KEY constraint failed/i.test(err.message);
+    return {
+      success: false,
+      summary: emptySummary,
+      errorMessage: isFkFail
+        ? 'Import target is missing. The selected workspace may have been removed — pick a workspace and try again.'
+        : `Import failed: ${err.message}`,
+    };
   }
 }
 
@@ -956,6 +1091,34 @@ function toScriptRequestView(req: any): ScriptRequestView {
   };
 }
 
+/**
+ * Scripts only see `{key, value}` pairs. When writing their result back, keep
+ * the per-variable flags (`enabled`, `secret`) the user set in the env editor
+ * for keys that already existed; brand-new keys are enabled and not secret.
+ */
+function mergeScriptEnvVars(
+  environmentId: string,
+  finalVars: Array<{ key: string; value: string }>,
+) {
+  const existing = new Map<string, Record<string, unknown>>();
+  const env = getEnvironment(environmentId);
+  for (const v of (env?.variables ?? []) as Array<Record<string, unknown>>) {
+    if (typeof v.key === 'string') existing.set(v.key, v);
+  }
+  return finalVars.map((v) => {
+    const prev = existing.get(v.key);
+    // Only a key the script actually wrote loses its keychain ref (its value
+    // now lives in plain text); untouched keys keep enabled/secret/secretRef.
+    const changed = !prev || prev.value !== v.value;
+    return {
+      ...(prev ?? { enabled: true }),
+      key: v.key,
+      value: v.value,
+      ...(changed ? { enabled: true, secretRef: null } : {}),
+    };
+  });
+}
+
 function applyScriptRequestView(req: any, view: ScriptRequestView) {
   req.method = view.method;
   req.url = view.url;
@@ -969,11 +1132,19 @@ function applyScriptRequestView(req: any, view: ScriptRequestView) {
   req.body = view.body;
 }
 
+/** Shape of `preScript` / `postScript` on the send result (ScriptOutput + test results). */
+interface ScriptOutputView {
+  logs: string[];
+  error: string | null;
+  tests: ScriptTestResult[];
+}
+
 function toScriptResponseView(output: any): ScriptResponseView {
   if (!output.ok) {
     return {
       ok: false,
       status: null,
+      statusText: '',
       headers: [],
       text: output.errorMessage ?? null,
       json: null,
@@ -995,6 +1166,7 @@ function toScriptResponseView(output: any): ScriptResponseView {
   return {
     ok: true,
     status: output.statusCode,
+    statusText: output.statusText ?? '',
     headers: output.headers ?? [],
     text,
     json,
