@@ -1,7 +1,5 @@
 node_modules/
 .turbo/
-dist/
-build/
 out/
 *.log
 .env
@@ -11,9 +9,7 @@ out/
 coverage/
 *.tsbuildinfo
 
-# Electron
-apps/desktop/dist/
-apps/desktop/dist-electron/
+# Electron installers — too large for git (DMG > 100 MB); published as GitHub Release assets
 apps/desktop/release/
 
 # Local DB files (for dev tests)
