@@ -1,6 +1,8 @@
 import { Select } from '@/components/ui/Select';
 import { KeyValueEditor, type KeyValueRow } from './KeyValueEditor';
 import { CodeEditor } from './CodeEditor';
+import { beautifyJson } from '@/lib/json-format';
+import { toast } from '@/stores/toasts';
 
 interface RawBody {
   type: 'raw';
@@ -97,6 +99,24 @@ export function BodyEditor({ body, onChange }: Props) {
               ]}
               className="w-28"
             />
+            {(body.language ?? 'json') === 'json' && (
+              <button
+                type="button"
+                onClick={() => {
+                  if (!body.content.trim()) return;
+                  try {
+                    onChange({ ...body, content: beautifyJson(body.content) });
+                  } catch (err) {
+                    toast.error('Invalid JSON — cannot beautify', err);
+                  }
+                }}
+                disabled={!body.content.trim()}
+                className="ml-auto rounded border border-border px-2 py-0.5 text-[11px] text-text-muted hover:bg-bg-elevated hover:text-text disabled:opacity-40 disabled:hover:bg-transparent"
+                title="Format JSON with 2-space indentation"
+              >
+                Beautify
+              </button>
+            )}
           </>
         )}
       </div>
