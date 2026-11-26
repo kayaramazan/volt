@@ -1137,6 +1137,26 @@ export declare const PluginsApplyTransformerContract: {
         ok: false;
     }>]>;
 };
+/** Local MCP server (Streamable HTTP on 127.0.0.1) started with the app. */
+export declare const McpStatusContract: {
+    readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+    readonly output: z.ZodObject<{
+        running: z.ZodBoolean;
+        port: z.ZodNumber;
+        url: z.ZodString;
+        error: z.ZodOptional<z.ZodString>;
+    }, "strip", z.ZodTypeAny, {
+        url: string;
+        running: boolean;
+        port: number;
+        error?: string | undefined;
+    }, {
+        url: string;
+        running: boolean;
+        port: number;
+        error?: string | undefined;
+    }>;
+};
 export declare const MockStatusContract: {
     readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
     readonly output: z.ZodObject<{
@@ -7739,6 +7759,25 @@ export declare const IPC: {
             ok: boolean;
         }, {
             ok: boolean;
+        }>;
+    };
+    readonly 'mcp:status': {
+        readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+        readonly output: z.ZodObject<{
+            running: z.ZodBoolean;
+            port: z.ZodNumber;
+            url: z.ZodString;
+            error: z.ZodOptional<z.ZodString>;
+        }, "strip", z.ZodTypeAny, {
+            url: string;
+            running: boolean;
+            port: number;
+            error?: string | undefined;
+        }, {
+            url: string;
+            running: boolean;
+            port: number;
+            error?: string | undefined;
         }>;
     };
     readonly 'mock:status': {

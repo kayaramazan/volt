@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { LogOut, Monitor, Trash2, Users } from 'lucide-react';
+import { Copy, LogOut, Monitor, Trash2, Users } from 'lucide-react';
 import { useQuery } from '@tanstack/react-query';
 
 import { Dialog } from '@/components/ui/Dialog';
@@ -18,6 +18,8 @@ import {
 import { useTheme, type ThemePref } from '@/stores/theme';
 import { Select } from '@/components/ui/Select';
 import { formatRelativeTime } from '@/lib/util';
+import { voltApi } from '@/lib/volt-api';
+import { toast } from '@/stores/toasts';
 
 interface MeResponse {
   id: string;
@@ -139,6 +141,13 @@ export function SettingsModal() {
 
         <section>
           <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">
+            MCP server
+          </h3>
+          <McpSection open={isOpen} />
+        </section>
+
+        <section>
+          <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-text-muted">
             About
           </h3>
           <div className="space-y-1 rounded-md border border-border bg-bg p-3 text-xs text-text-muted">
@@ -175,6 +184,53 @@ export function SettingsModal() {
         )}
       </div>
     </Dialog>
+  );
+}
+
+/**
+ * Status of the local MCP server (electron/core/mcp/server.ts) plus the
+ * one-liner to register it with Claude Code.
+ */
+function McpSection({ open }: { open: boolean }) {
+  const { data: status } = useQuery({
+    queryKey: ['mcp-status'],
+    queryFn: () => voltApi['mcp:status']({}),
+    enabled: open,
+  });
+  if (!status) return null;
+  const command = `claude mcp add --transport http volt ${status.url}`;
+  const copy = () => {
+    void navigator.clipboard.writeText(command).then(() => toast.success('Copied'));
+  };
+  return (
+    <div className="space-y-2 rounded-md border border-border bg-bg p-3 text-xs text-text-muted">
+      <p className="flex items-center gap-1.5">
+        <span
+          className={`inline-block h-1.5 w-1.5 rounded-full ${status.running ? 'bg-green-500' : 'bg-red-500'}`}
+        />
+        {status.running ? (
+          <>
+            Running at <span className="font-mono text-[11px] text-text">{status.url}</span>
+          </>
+        ) : (
+          <span className="text-text">{status.error ?? 'Not running'}</span>
+        )}
+      </p>
+      {status.running && (
+        <div className="flex items-center gap-1">
+          <code className="flex-1 truncate rounded bg-bg-elevated px-1.5 py-1 font-mono text-[10px] text-text">
+            {command}
+          </code>
+          <Button size="icon" variant="ghost" title="Copy command" onClick={copy}>
+            <Copy size={12} />
+          </Button>
+        </div>
+      )}
+      <p className="text-[10px]">
+        AI agents can browse collections, create folders and requests, import, export and send requests while
+        Volt is open.
+      </p>
+    </div>
   );
 }
 

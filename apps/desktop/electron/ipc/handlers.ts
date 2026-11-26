@@ -95,11 +95,9 @@ import {
 } from '../core/scripts/runner';
 import { resolveRequest } from '../core/http/resolve';
 import { forceSync, getSyncStatus, notifyDirty, startSync, stopSync, refreshRemoteWorkspaces } from '../core/sync/engine';
-import { importPostman } from '../core/import/postman';
-import { importInsomnia } from '../core/import/insomnia';
-import { importOpenAPI } from '../core/import/openapi';
-import { importCurl } from '../core/import/curl';
-import { importHar } from '../core/import/har';
+import { runImport } from '../core/import/run';
+import { deliverSendOutput } from '../core/mcp/capture';
+import { getMcpStatus } from '../core/mcp/server';
 import { exportPostman } from '../core/export/postman';
 import { exportInsomnia } from '../core/export/insomnia';
 import { exportOpenAPI } from '../core/export/openapi';
@@ -206,13 +204,15 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         }
         if (!result.ok) {
           recordWidgetResult(requestId, { ok: false, errorMessage: `Pre-request script failed` });
-          return {
+          const failed = {
             ok: false as const,
             errorCode: 'PRE_SCRIPT_ERROR',
             errorMessage: `Pre-request script failed: ${result.error}`,
             timing: emptyTiming(),
             preScript: preScriptOutput,
           };
+          deliverSendOutput(requestId, failed);
+          return failed;
         }
         applyScriptRequestView(request, result.request);
       }
@@ -273,7 +273,9 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       }
 
       recordWidgetResult(requestId, output);
-      return { ...output, preScript: preScriptOutput, postScript: postScriptOutput };
+      const final = { ...output, preScript: preScriptOutput, postScript: postScriptOutput };
+      deliverSendOutput(requestId, final);
+      return final;
     }
     case 'ws:open': {
       // headers/protocols are forwarded when the contract carries them.
@@ -333,6 +335,8 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       const { connectionId } = input as { connectionId: string };
       return grpcStreamClose(connectionId);
     }
+    case 'mcp:status':
+      return getMcpStatus();
     case 'mock:status': {
       return getMockStatus();
     }
@@ -918,119 +922,6 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
 
     default:
       throw new Error(`Unknown IPC channel: ${channel}`);
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// Import dispatch
-// ─────────────────────────────────────────────────────────
-
-function runImport(args: {
-  workspaceId: string;
-  source: 'postman' | 'insomnia' | 'openapi' | 'curl' | 'har';
-  filePath?: string;
-  content?: string;
-}) {
-  const emptySummary = { collections: 0, requests: 0, environments: 0, warnings: [] };
-
-  // Guard against stale workspaceIds (workspace deleted locally or via sync
-  // while the renderer still holds the id). Without this the SQLite insert
-  // bubbles up as a raw "FOREIGN KEY constraint failed" through the IPC.
-  if (!getWorkspace(args.workspaceId)) {
-    return {
-      success: false,
-      summary: emptySummary,
-      errorMessage:
-        'Selected workspace no longer exists. Pick a workspace from the sidebar and try again.',
-    };
-  }
-
-  let content = args.content;
-  if (!content && args.filePath) {
-    try {
-      content = fs.readFileSync(args.filePath, 'utf-8');
-    } catch (e) {
-      return {
-        success: false,
-        summary: emptySummary,
-        errorMessage: `Couldn't read file: ${(e as Error).message}`,
-      };
-    }
-  }
-  if (!content) {
-    return {
-      success: false,
-      summary: emptySummary,
-      errorMessage: 'No content or file provided.',
-    };
-  }
-
-  try {
-    switch (args.source) {
-      case 'postman': {
-        const r = importPostman(args.workspaceId, content);
-        return {
-          success: r.success,
-          collectionId: r.rootCollectionId,
-          summary: r.summary,
-          errorMessage: r.error,
-        };
-      }
-      case 'insomnia': {
-        const r = importInsomnia(args.workspaceId, content);
-        return {
-          success: r.success,
-          collectionId: r.rootCollectionId,
-          summary: r.summary,
-          errorMessage: r.error,
-        };
-      }
-      case 'openapi': {
-        const ext = args.filePath?.toLowerCase().endsWith('.yaml') || args.filePath?.toLowerCase().endsWith('.yml')
-          ? 'yaml'
-          : 'json';
-        const r = importOpenAPI(args.workspaceId, content, ext);
-        return {
-          success: r.success,
-          collectionId: r.rootCollectionId,
-          summary: r.summary,
-          errorMessage: r.error,
-        };
-      }
-      case 'curl': {
-        const r = importCurl(args.workspaceId, null, content);
-        return {
-          success: r.success,
-          requestId: r.requestId,
-          summary: r.summary,
-          errorMessage: r.error,
-        };
-      }
-      case 'har': {
-        const r = importHar(args.workspaceId, content);
-        return {
-          success: r.success,
-          collectionId: r.rootCollectionId,
-          summary: r.summary,
-          errorMessage: r.error,
-        };
-      }
-    }
-  } catch (e) {
-    const err = e as Error & { code?: string };
-    // FK failures are almost always a workspace race (deleted between the
-    // up-front check and the inserts). Surface a friendly message instead of
-    // the raw SqliteError that the renderer would otherwise show.
-    const isFkFail =
-      err.code === 'SQLITE_CONSTRAINT_FOREIGNKEY' ||
-      /FOREIGN KEY constraint failed/i.test(err.message);
-    return {
-      success: false,
-      summary: emptySummary,
-      errorMessage: isFkFail
-        ? 'Import target is missing. The selected workspace may have been removed — pick a workspace and try again.'
-        : `Import failed: ${err.message}`,
-    };
   }
 }
 

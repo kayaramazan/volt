@@ -32,6 +32,7 @@ export function useSyncEvents() {
             qc.invalidateQueries({ queryKey: ['request'] });
           } else if (e.table === 'environment') {
             qc.invalidateQueries({ queryKey: ['environments', e.workspaceId] });
+            qc.invalidateQueries({ queryKey: ['active-env', e.workspaceId] });
           } else if (e.table === 'workspace') {
             // A team workspace was added, renamed or removed remotely.
             qc.invalidateQueries({ queryKey: ['workspaces'] });

@@ -213,6 +213,17 @@ export const PluginsApplyTransformerContract = {
 
 // Mock server — local HTTP server that answers matching requests with
 // predefined responses (per-collection mocks). Status broadcast on change.
+/** Local MCP server (Streamable HTTP on 127.0.0.1) started with the app. */
+export const McpStatusContract = {
+  input: z.object({}),
+  output: z.object({
+    running: z.boolean(),
+    port: z.number().int().min(1).max(65535),
+    url: z.string(),
+    error: z.string().optional(),
+  }),
+} as const;
+
 export const MockStatusContract = {
   input: z.object({}),
   output: z.object({
@@ -782,6 +793,7 @@ export const IPC = {
   'grpc:streamHalfClose': GrpcStreamHalfCloseContract,
   'grpc:streamClose': GrpcStreamCloseContract,
 
+  'mcp:status': McpStatusContract,
   'mock:status': MockStatusContract,
   'mock:start': MockStartContract,
   'mock:stop': MockStopContract,
