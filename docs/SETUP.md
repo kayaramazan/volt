@@ -77,7 +77,7 @@ VOLT_USER_DATA_DIR="$HOME/Library/Application Support/@volt/desktop-dev" pnpm de
 
 ### MCP server for AI agents
 
-While the desktop app is open it serves an MCP endpoint (Streamable HTTP) at `http://127.0.0.1:7465/mcp`. AI agents can use it to list collections, add collections, folders, requests and environments, import and export, and send saved requests. A send behaves like the Send button and uses the active environment, auth and scripts.
+While the desktop app is open it serves an MCP endpoint (Streamable HTTP) at `http://127.0.0.1:7465/mcp`. AI agents can use it to browse and search collections, add collections, folders, requests and environments, import and export, and send saved requests. A send behaves like the Send button and uses the active environment, auth and scripts.
 
 ```bash
 claude mcp add --transport http volt http://127.0.0.1:7465/mcp

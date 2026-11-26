@@ -240,6 +240,98 @@ function maskVariables(vars: z.infer<typeof Variable>[]) {
 const BODY_PREVIEW_BYTES = 100_000;
 
 // ─────────────────────────────────────────────────────────
+// Collection tree (get_collection_tree / search_requests)
+// ─────────────────────────────────────────────────────────
+
+const TREE_MAX_REQUESTS = 200;
+
+interface TreeRequest {
+  id: string;
+  name: string;
+  method: string;
+  url: string;
+}
+
+interface TreeNode {
+  id: string;
+  name: string;
+  parentId: string | null;
+  folders: TreeNode[];
+  requests: TreeRequest[];
+  folderCount: number;
+  requestCount: number;
+}
+
+function buildTree(workspaceId: string) {
+  const cols = [...listCollections(workspaceId)].sort((x, y) => x.sortOrder - y.sortOrder);
+  const reqs = [...listRequests(workspaceId)].sort((x, y) => x.sortOrder - y.sortOrder);
+  const nodes = new Map<string, TreeNode>();
+  for (const c of cols) {
+    nodes.set(c.id, { id: c.id, name: c.name, parentId: c.parentId, folders: [], requests: [], folderCount: 0, requestCount: 0 });
+  }
+  const roots: TreeNode[] = [];
+  for (const n of nodes.values()) {
+    const parent = n.parentId ? nodes.get(n.parentId) : undefined;
+    if (parent) parent.folders.push(n);
+    else roots.push(n);
+  }
+  const rootRequests: TreeRequest[] = [];
+  for (const r of reqs) {
+    const item = { id: r.id, name: r.name, method: r.method, url: r.url };
+    const node = r.collectionId ? nodes.get(r.collectionId) : undefined;
+    if (node) node.requests.push(item);
+    else rootRequests.push(item);
+  }
+  const count = (n: TreeNode) => {
+    n.folderCount = n.folders.length;
+    n.requestCount = n.requests.length;
+    for (const f of n.folders) {
+      count(f);
+      n.folderCount += f.folderCount;
+      n.requestCount += f.requestCount;
+    }
+  };
+  roots.forEach(count);
+  const pathOf = (nodeId: string) => {
+    const parts: string[] = [];
+    for (let n = nodes.get(nodeId); n; n = n.parentId ? nodes.get(n.parentId) : undefined) parts.unshift(n.name);
+    return parts.join(' / ');
+  };
+  return { nodes, roots, rootRequests, pathOf };
+}
+
+function takeRequests(list: TreeRequest[], budget: { left: number; truncated: boolean }) {
+  const out = list.slice(0, Math.max(0, budget.left));
+  budget.left -= out.length;
+  if (out.length < list.length) budget.truncated = true;
+  return out;
+}
+
+/**
+ * Copy of `node` expanded `depth` folder levels down. A node at the edge
+ * (depth 0) is a summary: id, name and recursive counts — open it with
+ * collectionId to see inside.
+ */
+function renderNode(
+  node: TreeNode,
+  depth: number,
+  includeRequests: boolean,
+  budget: { left: number; truncated: boolean },
+): Json {
+  const expanded = depth > 0;
+  return {
+    id: node.id,
+    name: node.name,
+    folderCount: node.folderCount,
+    requestCount: node.requestCount,
+    ...(expanded && includeRequests && node.requests.length > 0 && { requests: takeRequests(node.requests, budget) }),
+    ...(expanded && node.folders.length > 0 && {
+      folders: node.folders.map((f) => renderNode(f, depth - 1, includeRequests, budget)),
+    }),
+  };
+}
+
+// ─────────────────────────────────────────────────────────
 // Tools
 // ─────────────────────────────────────────────────────────
 
@@ -285,49 +377,113 @@ export const MCP_TOOLS: ToolDef[] = [
     name: 'get_collection_tree',
     title: 'Get collection tree',
     description:
-      'Return the collections, nested folders and requests (id, name, method, url) of a workspace as a tree. ' +
-      'Pass collectionId to get only that subtree. Requests outside any collection are listed under rootRequests.',
+      'Browse the collections and folders of a workspace. Each node has folderCount/requestCount (recursive totals). ' +
+      'Without collectionId: top-level collections and their folders as summaries, no requests. ' +
+      'With collectionId: that folder\'s own requests and its sub-folders as summaries; open a sub-folder by its id. ' +
+      'depth = folder levels to expand (default 1); ' +
+      `at most ${TREE_MAX_REQUESTS} requests are returned per call (truncated: true when cut). Use search_requests to find a request by name/url.`,
     inputSchema: {
       type: 'object',
-      properties: { workspaceId: { type: 'string' }, collectionId: { type: 'string' } },
+      properties: {
+        workspaceId: { type: 'string' },
+        collectionId: { type: 'string', description: 'Folder/collection to open' },
+        depth: { type: 'integer', minimum: 0, maximum: 20, description: 'Folder levels to expand; edge folders show counts only' },
+        includeRequests: { type: 'boolean', description: 'List requests inside expanded folders' },
+      },
       required: ['workspaceId'],
     },
     annotations: { readOnlyHint: true },
     run: (args) => {
-      const a = parse(z.object({ workspaceId: id, collectionId: id.optional() }), args);
+      const a = parse(
+        z.object({
+          workspaceId: id,
+          collectionId: id.optional(),
+          depth: z.number().int().min(0).max(20).optional(),
+          includeRequests: z.boolean().optional(),
+        }),
+        args,
+      );
       requireWorkspace(a.workspaceId);
-      const cols = listCollections(a.workspaceId);
-      const reqs = listRequests(a.workspaceId);
-      type Node = { id: string; name: string; description?: string; folders: Node[]; requests: unknown[] };
-      const nodes = new Map<string, Node>();
-      for (const c of cols) {
-        nodes.set(c.id, {
-          id: c.id,
-          name: c.name,
-          ...(c.description ? { description: c.description.slice(0, 300) } : {}),
-          folders: [],
-          requests: [],
-        });
-      }
-      const roots: Node[] = [];
-      for (const c of [...cols].sort((x, y) => x.sortOrder - y.sortOrder)) {
-        const node = nodes.get(c.id)!;
-        const parent = c.parentId ? nodes.get(c.parentId) : undefined;
-        if (parent) parent.folders.push(node);
-        else roots.push(node);
-      }
-      const rootRequests: unknown[] = [];
-      for (const r of [...reqs].sort((x, y) => x.sortOrder - y.sortOrder)) {
-        const node = r.collectionId ? nodes.get(r.collectionId) : undefined;
-        if (node) node.requests.push(requestSummary(r));
-        else rootRequests.push(requestSummary(r));
-      }
+      const tree = buildTree(a.workspaceId);
+      const depth = a.depth ?? 1;
+      const includeRequests = a.includeRequests ?? Boolean(a.collectionId);
+      const budget = { left: TREE_MAX_REQUESTS, truncated: false };
+
       if (a.collectionId) {
-        const node = nodes.get(a.collectionId);
+        const node = tree.nodes.get(a.collectionId);
         if (!node) throw new Error(`Collection/folder not found: ${a.collectionId}`);
-        return { collection: node };
+        const collection = renderNode(node, depth, includeRequests, budget);
+        return { path: tree.pathOf(node.id), collection, ...(budget.truncated && { truncated: true }) };
       }
-      return { collections: roots, rootRequests };
+      const collections = tree.roots.map((n) => renderNode(n, depth, includeRequests, budget));
+      return {
+        collections,
+        rootRequestCount: tree.rootRequests.length,
+        ...(includeRequests && { rootRequests: takeRequests(tree.rootRequests, budget) }),
+        ...(budget.truncated && { truncated: true }),
+      };
+    },
+  },
+  {
+    name: 'search_requests',
+    title: 'Search requests',
+    description:
+      'Find saved requests whose name or URL contains all words of query (case-insensitive), optionally filtered by ' +
+      'method and limited to a collection/folder subtree. Returns id, method, name, url and the folder path.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspaceId: { type: 'string' },
+        query: { type: 'string', description: 'Words to match in name or URL, e.g. "user login"' },
+        method: { type: 'string', enum: METHODS },
+        collectionId: { type: 'string', description: 'Only search inside this collection/folder' },
+        limit: { type: 'integer', minimum: 1, maximum: 200, default: 50 },
+      },
+      required: ['workspaceId'],
+    },
+    annotations: { readOnlyHint: true },
+    run: (args) => {
+      const a = parse(
+        z.object({
+          workspaceId: id,
+          query: z.string().max(500).optional(),
+          method: z.enum(METHODS).optional(),
+          collectionId: id.optional(),
+          limit: z.number().int().min(1).max(200).default(50),
+        }),
+        args,
+      );
+      requireWorkspace(a.workspaceId);
+      const tree = buildTree(a.workspaceId);
+      let scope: Set<string> | null = null;
+      if (a.collectionId) {
+        const start = tree.nodes.get(a.collectionId);
+        if (!start) throw new Error(`Collection/folder not found: ${a.collectionId}`);
+        scope = new Set<string>();
+        const walk = (n: TreeNode) => {
+          scope!.add(n.id);
+          n.folders.forEach(walk);
+        };
+        walk(start);
+      }
+      const words = (a.query ?? '').toLowerCase().split(/\s+/).filter(Boolean);
+      const matches = listRequests(a.workspaceId).filter((r) => {
+        if (a.method && r.method !== a.method) return false;
+        if (scope && !(r.collectionId && scope.has(r.collectionId))) return false;
+        const hay = `${r.name} ${r.url}`.toLowerCase();
+        return words.every((w) => hay.includes(w));
+      });
+      return {
+        total: matches.length,
+        requests: matches.slice(0, a.limit).map((r) => ({
+          id: r.id,
+          method: r.method,
+          name: r.name,
+          url: r.url,
+          path: r.collectionId ? tree.pathOf(r.collectionId) : '',
+        })),
+        ...(matches.length > a.limit && { truncated: true }),
+      };
     },
   },
   {

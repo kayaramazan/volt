@@ -25,7 +25,7 @@ const MAX_BODY_BYTES = 20 * 1024 * 1024; // imports can be big
 const SUPPORTED_PROTOCOLS = ['2025-06-18', '2025-03-26', '2024-11-05'];
 
 const INSTRUCTIONS = `Volt is a local-first API client (like Postman). Data model: workspace → collections (folders nest via parentId) → requests. \
-Start with list_workspaces, then get_collection_tree. Requests may use {{variables}} resolved from the active environment, collection variables and globals. \
+Start with list_workspaces, then get_collection_tree (an overview with counts; open folders by collectionId) or search_requests to find a request by name/URL. Requests may use {{variables}} resolved from the active environment, collection variables and globals. \
 send_request runs a saved request exactly like the app's Send button (active environment, auth, scripts) and records it in history. \
 Changes appear in the open Volt window immediately.`;
 
@@ -243,7 +243,7 @@ async function handleRpc(raw: unknown): Promise<unknown | null> {
       try {
         const result = await callTool(name, args);
         return rpcResult(id, {
-          content: [{ type: 'text', text: JSON.stringify(result, null, 2) }],
+          content: [{ type: 'text', text: JSON.stringify(result) }],
           structuredContent: result,
         });
       } catch (e) {
