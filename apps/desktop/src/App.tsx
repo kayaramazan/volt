@@ -36,6 +36,7 @@ import { ChainModal } from '@/components/modals/ChainModal';
 import { CollectionMocksModal } from '@/components/modals/CollectionMocksModal';
 import { MockSettingsModal } from '@/components/modals/MockSettingsModal';
 import { PluginsModal } from '@/components/modals/PluginsModal';
+import { McpModal } from '@/components/modals/McpModal';
 import { ConflictsModal } from '@/components/modals/ConflictsModal';
 
 const OFFLINE_SKIP_KEY = 'volt:offline-skip';
@@ -207,6 +208,7 @@ export function App() {
       <CollectionMocksModal />
       <MockSettingsModal />
       <PluginsModal />
+      <McpModal />
       <ConflictsModal />
       <Toaster />
     </div>

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Command } from 'cmdk';
-import { Globe, Plug, Puzzle, Search, FileText, FolderPlus, Link2, Upload, Settings, LogOut } from 'lucide-react';
+import { Bot, Globe, Plug, Puzzle, Search, FileText, FolderPlus, Link2, Upload, Settings, LogOut } from 'lucide-react';
 
 import { useRequests, useCollections, useSignOut } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
@@ -194,6 +194,17 @@ export function CommandPalette() {
           >
             <Puzzle size={13} />
             <span>Plugins…</span>
+          </Command.Item>
+          <Command.Item
+            value="mcp server ai agents claude tools activity"
+            onSelect={() => {
+              close();
+              open({ kind: 'mcp' });
+            }}
+            className="cmd-item"
+          >
+            <Bot size={13} />
+            <span>MCP server…</span>
           </Command.Item>
           <Command.Item
             value="settings preferences"

@@ -75,6 +75,16 @@ The app takes a single-instance lock on its `userData` directory. If an installe
 VOLT_USER_DATA_DIR="$HOME/Library/Application Support/@volt/desktop-dev" pnpm dev:desktop
 ```
 
+### MCP server for AI agents
+
+While the desktop app is open it serves an MCP endpoint (Streamable HTTP) at `http://127.0.0.1:7465/mcp`. AI agents can use it to browse and search collections, add collections, folders, requests and environments, import and export, and send saved requests. A send behaves like the Send button and uses the active environment, auth and scripts.
+
+```bash
+claude mcp add --transport http volt http://127.0.0.1:7465/mcp
+```
+
+The **MCP** button in the top bar (or ⌘K → MCP server) opens the MCP panel. It has connection snippets for Claude Code, Cursor and stdio-only clients, docs for every tool generated from the live catalogue, and an Activity tab that shows connected agents and each tool call with its arguments, result or error, updated live. The activity log stays in memory and resets when Volt restarts. The server only listens on loopback and rejects requests from browser pages, so websites can't call it. Set `VOLT_MCP_PORT` to change the port, for example when a dev build runs next to the installed app.
+
 ## 4. Run the sync backend (optional)
 
 Only needed for accounts, cross-device sync, and teams.
@@ -183,6 +193,7 @@ Release signing uses the standard electron-builder variables: `CSC_LINK`, `CSC_K
 |----------|---------|---------|
 | `VITE_API_URL` / `VOLT_API_URL` | `http://localhost:4000` in dev, `https://api.volt.dev` packaged | Sync API base URL |
 | `VOLT_USER_DATA_DIR` | Electron default | Override the `userData` directory |
+| `VOLT_MCP_PORT` | `7465` | Port of the local MCP server (`127.0.0.1` only) |
 
 **CLI**
 
