@@ -224,6 +224,57 @@ export const McpStatusContract = {
   }),
 } as const;
 
+/** Everything the in-app MCP panel shows: status, tool docs, clients, call log. */
+export const McpInfoContract = {
+  input: z.object({}),
+  output: z.object({
+    status: McpStatusContract.output,
+    tools: z.array(
+      z.object({
+        name: z.string(),
+        title: z.string(),
+        description: z.string(),
+        inputSchema: z.record(z.unknown()),
+        readOnly: z.boolean(),
+        destructive: z.boolean(),
+      }),
+    ),
+    clients: z.array(
+      z.object({
+        sessionId: z.string(),
+        name: z.string(),
+        version: z.string().nullable(),
+        protocolVersion: z.string().nullable(),
+        userAgent: z.string().nullable(),
+        connectedAt: z.number(),
+        lastSeenAt: z.number(),
+        callCount: z.number().int(),
+        closed: z.boolean(),
+        active: z.boolean(),
+      }),
+    ),
+    calls: z.array(
+      z.object({
+        id: z.number().int(),
+        at: z.number(),
+        sessionId: z.string().nullable(),
+        clientName: z.string(),
+        tool: z.string(),
+        args: z.string(),
+        ok: z.boolean(),
+        error: z.string().nullable(),
+        result: z.string().nullable(),
+        durationMs: z.number(),
+      }),
+    ),
+  }),
+} as const;
+
+export const McpClearActivityContract = {
+  input: z.object({}),
+  output: z.object({ ok: z.literal(true) }),
+} as const;
+
 export const MockStatusContract = {
   input: z.object({}),
   output: z.object({
@@ -794,6 +845,8 @@ export const IPC = {
   'grpc:streamClose': GrpcStreamCloseContract,
 
   'mcp:status': McpStatusContract,
+  'mcp:info': McpInfoContract,
+  'mcp:clearActivity': McpClearActivityContract,
   'mock:status': MockStatusContract,
   'mock:start': MockStartContract,
   'mock:stop': MockStopContract,

@@ -197,6 +197,7 @@ function McpSection({ open }: { open: boolean }) {
     queryFn: () => voltApi['mcp:status']({}),
     enabled: open,
   });
+  const { open: openModal } = useModals();
   if (!status) return null;
   const command = `claude mcp add --transport http volt ${status.url}`;
   const copy = () => {
@@ -226,10 +227,15 @@ function McpSection({ open }: { open: boolean }) {
           </Button>
         </div>
       )}
-      <p className="text-[10px]">
-        AI agents can browse collections, create folders and requests, import, export and send requests while
-        Volt is open.
-      </p>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-[10px]">
+          AI agents can browse collections, create folders and requests, import, export and send requests while
+          Volt is open.
+        </p>
+        <Button size="sm" variant="ghost" onClick={() => openModal({ kind: 'mcp' })}>
+          Docs &amp; activity
+        </Button>
+      </div>
     </div>
   );
 }

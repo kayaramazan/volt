@@ -83,7 +83,7 @@ While the desktop app is open it serves an MCP endpoint (Streamable HTTP) at `ht
 claude mcp add --transport http volt http://127.0.0.1:7465/mcp
 ```
 
-Settings → MCP server shows the status and the exact command. The server only listens on loopback and rejects requests from browser pages, so websites can't call it. Set `VOLT_MCP_PORT` to change the port, for example when a dev build runs next to the installed app.
+The **MCP** button in the top bar (or ⌘K → MCP server) opens the MCP panel. It has connection snippets for Claude Code, Cursor and stdio-only clients, docs for every tool generated from the live catalogue, and an Activity tab that shows connected agents and each tool call with its arguments, result or error, updated live. The activity log stays in memory and resets when Volt restarts. The server only listens on loopback and rejects requests from browser pages, so websites can't call it. Set `VOLT_MCP_PORT` to change the port, for example when a dev build runs next to the installed app.
 
 ## 4. Run the sync backend (optional)
 

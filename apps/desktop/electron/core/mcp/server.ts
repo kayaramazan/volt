@@ -7,6 +7,9 @@
 //
 //   claude mcp add --transport http volt http://127.0.0.1:7465/mcp
 //
+// Sessions: `initialize` hands out an Mcp-Session-Id that only labels the
+// client in the MCP panel (core/mcp/activity.ts); unknown ids are accepted.
+//
 // Security: loopback-only bind, Host header must be a loopback name (DNS
 // rebinding), and requests carrying a non-loopback Origin are refused, so web
 // pages in a browser can't drive it.
@@ -14,10 +17,12 @@
 // Port: VOLT_MCP_PORT env var > app_state `mcp.port` > 7465.
 
 import http from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { app } from 'electron';
 
 import { getState } from '../db/queries';
 import { MCP_TOOLS, callTool, ToolInputError } from './tools';
+import { closeClient, recordCall, registerClient, touchClient } from './activity';
 
 const DEFAULT_PORT = 7465;
 const STATE_PORT_KEY = 'mcp.port';
@@ -83,6 +88,18 @@ export function startMcpServer(): Promise<void> {
   });
 }
 
+/** Tool catalogue for the in-app MCP docs. */
+export function getMcpTools() {
+  return MCP_TOOLS.map((t) => ({
+    name: t.name,
+    title: t.title,
+    description: t.description,
+    inputSchema: t.inputSchema,
+    readOnly: Boolean(t.annotations?.readOnlyHint),
+    destructive: Boolean(t.annotations?.destructiveHint),
+  }));
+}
+
 export function stopMcpServer() {
   state.server?.close();
   state.server = null;
@@ -117,13 +134,19 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
   if (!isLoopbackHost(req.headers.host) || !isAllowedOrigin(req.headers.origin)) {
     return sendJson(res, 403, rpcError(null, -32000, 'Forbidden origin'));
   }
-  if (req.method === 'GET' || req.method === 'DELETE') {
-    // Stateless server: no server-initiated SSE stream, no sessions.
-    res.writeHead(405, { Allow: 'POST' }).end();
+  const sessionHeader = req.headers['mcp-session-id'];
+  const sessionId = typeof sessionHeader === 'string' && sessionHeader ? sessionHeader : null;
+  const userAgent = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : null;
+
+  if (req.method === 'DELETE') {
+    // Client ending its session (sessions only label clients in the MCP panel).
+    if (sessionId) closeClient(sessionId);
+    res.writeHead(204).end();
     return;
   }
   if (req.method !== 'POST') {
-    res.writeHead(405, { Allow: 'POST' }).end();
+    // No server-initiated SSE stream: every reply is a plain JSON response.
+    res.writeHead(405, { Allow: 'POST, DELETE' }).end();
     return;
   }
 
@@ -141,18 +164,21 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse) {
     return sendJson(res, 400, rpcError(null, -32700, 'Parse error'));
   }
 
+  const ctx: RpcContext = { sessionId, userAgent, newSessionId: null };
+  touchClient(sessionId, userAgent);
   const messages = Array.isArray(message) ? message : [message];
   const replies: unknown[] = [];
   for (const m of messages) {
-    const reply = await handleRpc(m);
+    const reply = await handleRpc(m, ctx);
     if (reply) replies.push(reply);
   }
+  const headers: Record<string, string> = ctx.newSessionId ? { 'Mcp-Session-Id': ctx.newSessionId } : {};
   if (replies.length === 0) {
     // Only notifications / responses → 202 Accepted, no body.
-    res.writeHead(202).end();
+    res.writeHead(202, headers).end();
     return;
   }
-  sendJson(res, 200, Array.isArray(message) ? replies : replies[0]);
+  sendJson(res, 200, Array.isArray(message) ? replies : replies[0], headers);
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {
@@ -173,8 +199,8 @@ function readBody(req: http.IncomingMessage): Promise<string> {
   });
 }
 
-function sendJson(res: http.ServerResponse, status: number, body: unknown) {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
+function sendJson(res: http.ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}) {
+  res.writeHead(status, { 'Content-Type': 'application/json', ...headers });
   res.end(JSON.stringify(body));
 }
 
@@ -183,6 +209,13 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown) {
 // ─────────────────────────────────────────────────────────
 
 type RpcId = string | number | null;
+
+interface RpcContext {
+  sessionId: string | null;
+  userAgent: string | null;
+  /** Set by `initialize`; returned to the client as Mcp-Session-Id. */
+  newSessionId: string | null;
+}
 
 interface RpcMessage {
   jsonrpc?: string;
@@ -199,7 +232,7 @@ function rpcError(id: RpcId, code: number, message: string) {
   return { jsonrpc: '2.0', id, error: { code, message } };
 }
 
-async function handleRpc(raw: unknown): Promise<unknown | null> {
+async function handleRpc(raw: unknown, ctx: RpcContext): Promise<unknown | null> {
   const msg = raw as RpcMessage;
   if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') {
     return rpcError(null, -32600, 'Invalid Request');
@@ -214,6 +247,13 @@ async function handleRpc(raw: unknown): Promise<unknown | null> {
   switch (msg.method) {
     case 'initialize': {
       const requested = String(msg.params?.protocolVersion ?? '');
+      ctx.newSessionId = randomUUID();
+      registerClient(
+        ctx.newSessionId,
+        msg.params?.clientInfo as { name?: unknown; version?: unknown } | undefined,
+        requested || null,
+        ctx.userAgent,
+      );
       return rpcResult(id, {
         protocolVersion: SUPPORTED_PROTOCOLS.includes(requested) ? requested : SUPPORTED_PROTOCOLS[0],
         capabilities: { tools: { listChanged: false } },
@@ -240,8 +280,20 @@ async function handleRpc(raw: unknown): Promise<unknown | null> {
         return rpcError(id, -32602, `Unknown tool: ${name}`);
       }
       console.log(`[mcp] tools/call ${name}`);
+      const started = performance.now();
+      const log = (ok: boolean, extra: { error?: string; result?: unknown }) =>
+        recordCall({
+          sessionId: ctx.sessionId,
+          userAgent: ctx.userAgent,
+          tool: name,
+          args,
+          ok,
+          durationMs: performance.now() - started,
+          ...extra,
+        });
       try {
         const result = await callTool(name, args);
+        log(true, { result });
         return rpcResult(id, {
           content: [{ type: 'text', text: JSON.stringify(result) }],
           structuredContent: result,
@@ -250,6 +302,7 @@ async function handleRpc(raw: unknown): Promise<unknown | null> {
         // Tool failures go back as isError results so the model can recover.
         const message =
           e instanceof ToolInputError ? `Invalid arguments: ${e.message}` : (e as Error).message;
+        log(false, { error: message });
         return rpcResult(id, { content: [{ type: 'text', text: message }], isError: true });
       }
     }

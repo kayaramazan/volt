@@ -97,7 +97,8 @@ import { resolveRequest } from '../core/http/resolve';
 import { forceSync, getSyncStatus, notifyDirty, startSync, stopSync, refreshRemoteWorkspaces } from '../core/sync/engine';
 import { runImport } from '../core/import/run';
 import { deliverSendOutput } from '../core/mcp/capture';
-import { getMcpStatus } from '../core/mcp/server';
+import { getMcpStatus, getMcpTools } from '../core/mcp/server';
+import { clearActivity as clearMcpActivity, getActivity as getMcpActivity } from '../core/mcp/activity';
 import { exportPostman } from '../core/export/postman';
 import { exportInsomnia } from '../core/export/insomnia';
 import { exportOpenAPI } from '../core/export/openapi';
@@ -337,6 +338,11 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
     }
     case 'mcp:status':
       return getMcpStatus();
+    case 'mcp:info':
+      return { status: getMcpStatus(), tools: getMcpTools(), ...getMcpActivity() };
+    case 'mcp:clearActivity':
+      clearMcpActivity();
+      return { ok: true as const };
     case 'mock:status': {
       return getMockStatus();
     }

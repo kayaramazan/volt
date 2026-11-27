@@ -1157,6 +1157,206 @@ export declare const McpStatusContract: {
         error?: string | undefined;
     }>;
 };
+/** Everything the in-app MCP panel shows: status, tool docs, clients, call log. */
+export declare const McpInfoContract: {
+    readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+    readonly output: z.ZodObject<{
+        status: z.ZodObject<{
+            running: z.ZodBoolean;
+            port: z.ZodNumber;
+            url: z.ZodString;
+            error: z.ZodOptional<z.ZodString>;
+        }, "strip", z.ZodTypeAny, {
+            url: string;
+            running: boolean;
+            port: number;
+            error?: string | undefined;
+        }, {
+            url: string;
+            running: boolean;
+            port: number;
+            error?: string | undefined;
+        }>;
+        tools: z.ZodArray<z.ZodObject<{
+            name: z.ZodString;
+            title: z.ZodString;
+            description: z.ZodString;
+            inputSchema: z.ZodRecord<z.ZodString, z.ZodUnknown>;
+            readOnly: z.ZodBoolean;
+            destructive: z.ZodBoolean;
+        }, "strip", z.ZodTypeAny, {
+            name: string;
+            description: string;
+            title: string;
+            inputSchema: Record<string, unknown>;
+            readOnly: boolean;
+            destructive: boolean;
+        }, {
+            name: string;
+            description: string;
+            title: string;
+            inputSchema: Record<string, unknown>;
+            readOnly: boolean;
+            destructive: boolean;
+        }>, "many">;
+        clients: z.ZodArray<z.ZodObject<{
+            sessionId: z.ZodString;
+            name: z.ZodString;
+            version: z.ZodNullable<z.ZodString>;
+            protocolVersion: z.ZodNullable<z.ZodString>;
+            userAgent: z.ZodNullable<z.ZodString>;
+            connectedAt: z.ZodNumber;
+            lastSeenAt: z.ZodNumber;
+            callCount: z.ZodNumber;
+            closed: z.ZodBoolean;
+            active: z.ZodBoolean;
+        }, "strip", z.ZodTypeAny, {
+            name: string;
+            sessionId: string;
+            lastSeenAt: number;
+            version: string | null;
+            protocolVersion: string | null;
+            userAgent: string | null;
+            connectedAt: number;
+            callCount: number;
+            closed: boolean;
+            active: boolean;
+        }, {
+            name: string;
+            sessionId: string;
+            lastSeenAt: number;
+            version: string | null;
+            protocolVersion: string | null;
+            userAgent: string | null;
+            connectedAt: number;
+            callCount: number;
+            closed: boolean;
+            active: boolean;
+        }>, "many">;
+        calls: z.ZodArray<z.ZodObject<{
+            id: z.ZodNumber;
+            at: z.ZodNumber;
+            sessionId: z.ZodNullable<z.ZodString>;
+            clientName: z.ZodString;
+            tool: z.ZodString;
+            args: z.ZodString;
+            ok: z.ZodBoolean;
+            error: z.ZodNullable<z.ZodString>;
+            result: z.ZodNullable<z.ZodString>;
+            durationMs: z.ZodNumber;
+        }, "strip", z.ZodTypeAny, {
+            at: number;
+            sessionId: string | null;
+            id: number;
+            error: string | null;
+            ok: boolean;
+            durationMs: number;
+            clientName: string;
+            tool: string;
+            args: string;
+            result: string | null;
+        }, {
+            at: number;
+            sessionId: string | null;
+            id: number;
+            error: string | null;
+            ok: boolean;
+            durationMs: number;
+            clientName: string;
+            tool: string;
+            args: string;
+            result: string | null;
+        }>, "many">;
+    }, "strip", z.ZodTypeAny, {
+        status: {
+            url: string;
+            running: boolean;
+            port: number;
+            error?: string | undefined;
+        };
+        tools: {
+            name: string;
+            description: string;
+            title: string;
+            inputSchema: Record<string, unknown>;
+            readOnly: boolean;
+            destructive: boolean;
+        }[];
+        clients: {
+            name: string;
+            sessionId: string;
+            lastSeenAt: number;
+            version: string | null;
+            protocolVersion: string | null;
+            userAgent: string | null;
+            connectedAt: number;
+            callCount: number;
+            closed: boolean;
+            active: boolean;
+        }[];
+        calls: {
+            at: number;
+            sessionId: string | null;
+            id: number;
+            error: string | null;
+            ok: boolean;
+            durationMs: number;
+            clientName: string;
+            tool: string;
+            args: string;
+            result: string | null;
+        }[];
+    }, {
+        status: {
+            url: string;
+            running: boolean;
+            port: number;
+            error?: string | undefined;
+        };
+        tools: {
+            name: string;
+            description: string;
+            title: string;
+            inputSchema: Record<string, unknown>;
+            readOnly: boolean;
+            destructive: boolean;
+        }[];
+        clients: {
+            name: string;
+            sessionId: string;
+            lastSeenAt: number;
+            version: string | null;
+            protocolVersion: string | null;
+            userAgent: string | null;
+            connectedAt: number;
+            callCount: number;
+            closed: boolean;
+            active: boolean;
+        }[];
+        calls: {
+            at: number;
+            sessionId: string | null;
+            id: number;
+            error: string | null;
+            ok: boolean;
+            durationMs: number;
+            clientName: string;
+            tool: string;
+            args: string;
+            result: string | null;
+        }[];
+    }>;
+};
+export declare const McpClearActivityContract: {
+    readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+    readonly output: z.ZodObject<{
+        ok: z.ZodLiteral<true>;
+    }, "strip", z.ZodTypeAny, {
+        ok: true;
+    }, {
+        ok: true;
+    }>;
+};
 export declare const MockStatusContract: {
     readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
     readonly output: z.ZodObject<{
@@ -7778,6 +7978,205 @@ export declare const IPC: {
             running: boolean;
             port: number;
             error?: string | undefined;
+        }>;
+    };
+    readonly 'mcp:info': {
+        readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+        readonly output: z.ZodObject<{
+            status: z.ZodObject<{
+                running: z.ZodBoolean;
+                port: z.ZodNumber;
+                url: z.ZodString;
+                error: z.ZodOptional<z.ZodString>;
+            }, "strip", z.ZodTypeAny, {
+                url: string;
+                running: boolean;
+                port: number;
+                error?: string | undefined;
+            }, {
+                url: string;
+                running: boolean;
+                port: number;
+                error?: string | undefined;
+            }>;
+            tools: z.ZodArray<z.ZodObject<{
+                name: z.ZodString;
+                title: z.ZodString;
+                description: z.ZodString;
+                inputSchema: z.ZodRecord<z.ZodString, z.ZodUnknown>;
+                readOnly: z.ZodBoolean;
+                destructive: z.ZodBoolean;
+            }, "strip", z.ZodTypeAny, {
+                name: string;
+                description: string;
+                title: string;
+                inputSchema: Record<string, unknown>;
+                readOnly: boolean;
+                destructive: boolean;
+            }, {
+                name: string;
+                description: string;
+                title: string;
+                inputSchema: Record<string, unknown>;
+                readOnly: boolean;
+                destructive: boolean;
+            }>, "many">;
+            clients: z.ZodArray<z.ZodObject<{
+                sessionId: z.ZodString;
+                name: z.ZodString;
+                version: z.ZodNullable<z.ZodString>;
+                protocolVersion: z.ZodNullable<z.ZodString>;
+                userAgent: z.ZodNullable<z.ZodString>;
+                connectedAt: z.ZodNumber;
+                lastSeenAt: z.ZodNumber;
+                callCount: z.ZodNumber;
+                closed: z.ZodBoolean;
+                active: z.ZodBoolean;
+            }, "strip", z.ZodTypeAny, {
+                name: string;
+                sessionId: string;
+                lastSeenAt: number;
+                version: string | null;
+                protocolVersion: string | null;
+                userAgent: string | null;
+                connectedAt: number;
+                callCount: number;
+                closed: boolean;
+                active: boolean;
+            }, {
+                name: string;
+                sessionId: string;
+                lastSeenAt: number;
+                version: string | null;
+                protocolVersion: string | null;
+                userAgent: string | null;
+                connectedAt: number;
+                callCount: number;
+                closed: boolean;
+                active: boolean;
+            }>, "many">;
+            calls: z.ZodArray<z.ZodObject<{
+                id: z.ZodNumber;
+                at: z.ZodNumber;
+                sessionId: z.ZodNullable<z.ZodString>;
+                clientName: z.ZodString;
+                tool: z.ZodString;
+                args: z.ZodString;
+                ok: z.ZodBoolean;
+                error: z.ZodNullable<z.ZodString>;
+                result: z.ZodNullable<z.ZodString>;
+                durationMs: z.ZodNumber;
+            }, "strip", z.ZodTypeAny, {
+                at: number;
+                sessionId: string | null;
+                id: number;
+                error: string | null;
+                ok: boolean;
+                durationMs: number;
+                clientName: string;
+                tool: string;
+                args: string;
+                result: string | null;
+            }, {
+                at: number;
+                sessionId: string | null;
+                id: number;
+                error: string | null;
+                ok: boolean;
+                durationMs: number;
+                clientName: string;
+                tool: string;
+                args: string;
+                result: string | null;
+            }>, "many">;
+        }, "strip", z.ZodTypeAny, {
+            status: {
+                url: string;
+                running: boolean;
+                port: number;
+                error?: string | undefined;
+            };
+            tools: {
+                name: string;
+                description: string;
+                title: string;
+                inputSchema: Record<string, unknown>;
+                readOnly: boolean;
+                destructive: boolean;
+            }[];
+            clients: {
+                name: string;
+                sessionId: string;
+                lastSeenAt: number;
+                version: string | null;
+                protocolVersion: string | null;
+                userAgent: string | null;
+                connectedAt: number;
+                callCount: number;
+                closed: boolean;
+                active: boolean;
+            }[];
+            calls: {
+                at: number;
+                sessionId: string | null;
+                id: number;
+                error: string | null;
+                ok: boolean;
+                durationMs: number;
+                clientName: string;
+                tool: string;
+                args: string;
+                result: string | null;
+            }[];
+        }, {
+            status: {
+                url: string;
+                running: boolean;
+                port: number;
+                error?: string | undefined;
+            };
+            tools: {
+                name: string;
+                description: string;
+                title: string;
+                inputSchema: Record<string, unknown>;
+                readOnly: boolean;
+                destructive: boolean;
+            }[];
+            clients: {
+                name: string;
+                sessionId: string;
+                lastSeenAt: number;
+                version: string | null;
+                protocolVersion: string | null;
+                userAgent: string | null;
+                connectedAt: number;
+                callCount: number;
+                closed: boolean;
+                active: boolean;
+            }[];
+            calls: {
+                at: number;
+                sessionId: string | null;
+                id: number;
+                error: string | null;
+                ok: boolean;
+                durationMs: number;
+                clientName: string;
+                tool: string;
+                args: string;
+                result: string | null;
+            }[];
+        }>;
+    };
+    readonly 'mcp:clearActivity': {
+        readonly input: z.ZodObject<{}, "strip", z.ZodTypeAny, {}, {}>;
+        readonly output: z.ZodObject<{
+            ok: z.ZodLiteral<true>;
+        }, "strip", z.ZodTypeAny, {
+            ok: true;
+        }, {
+            ok: true;
         }>;
     };
     readonly 'mock:status': {

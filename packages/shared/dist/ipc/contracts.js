@@ -6,8 +6,8 @@
 //
 // Naming convention: <domain>:<verb>  (e.g., "request:send", "collection:list")
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.AuthLoginContract = exports.AuthStatusContract = exports.HistoryClearContract = exports.HistoryGetContract = exports.HistoryListContract = exports.EnvGetActiveContract = exports.EnvSetActiveContract = exports.EnvDeleteContract = exports.EnvUpdateContract = exports.EnvCreateContract = exports.EnvListContract = exports.RequestDeleteContract = exports.RequestUpdateContract = exports.RequestCreateContract = exports.RequestGetContract = exports.RequestListContract = exports.CollectionExportContract = exports.CollectionDuplicateContract = exports.CollectionDeleteContract = exports.CollectionUpdateContract = exports.CollectionCreateContract = exports.CollectionListContract = exports.WorkspaceDeleteContract = exports.WorkspaceRenameContract = exports.WidgetRunResultContract = exports.WidgetReadyContract = exports.WidgetSetFavoriteContract = exports.WidgetFavoritesContract = exports.WorkspaceCreateContract = exports.WorkspaceListContract = exports.WsCloseContract = exports.WsSendContract = exports.WsOpenContract = exports.MockStopContract = exports.MockStartContract = exports.MockStatusContract = exports.McpStatusContract = exports.PluginsApplyTransformerContract = exports.PluginsOpenFolderContract = exports.PluginsReloadContract = exports.PluginsListContract = exports.GrpcStreamCloseContract = exports.GrpcStreamHalfCloseContract = exports.GrpcStreamSendContract = exports.GrpcOpenStreamContract = exports.GrpcInvokeContract = exports.GrpcLoadProtoContract = exports.ResponseSaveBodyContract = exports.RequestCancelContract = exports.RequestSendContract = void 0;
-exports.MainEvent = exports.DataChangedEvent = exports.ConflictDetectedEvent = exports.SyncStateChangedEvent = exports.IPC = exports.AutoHeadersSetContract = exports.AutoHeadersGetContract = exports.OAuthExchangeCodeContract = exports.OAuthGetAuthUrlContract = exports.OAuthEnsureTokenContract = exports.GlobalsDeleteContract = exports.GlobalsSetContract = exports.GlobalsListContract = exports.TeamAuditLogContract = exports.TeamBillingPortalContract = exports.TeamBillingCheckoutContract = exports.TeamBillingContract = exports.TeamAcceptInviteContract = exports.TeamInviteContract = exports.TeamCreateContract = exports.TeamListContract = exports.ReadFileTextContract = exports.ShowFilePickerContract = exports.OpenExternalContract = exports.AppInfoContract = exports.ImportSourceContract = exports.ConflictRestoreContract = exports.ConflictDismissContract = exports.ConflictListContract = exports.SyncForceContract = exports.SyncStatusContract = exports.AuthLogoutContract = exports.AuthRegisterContract = void 0;
+exports.HistoryClearContract = exports.HistoryGetContract = exports.HistoryListContract = exports.EnvGetActiveContract = exports.EnvSetActiveContract = exports.EnvDeleteContract = exports.EnvUpdateContract = exports.EnvCreateContract = exports.EnvListContract = exports.RequestDeleteContract = exports.RequestUpdateContract = exports.RequestCreateContract = exports.RequestGetContract = exports.RequestListContract = exports.CollectionExportContract = exports.CollectionDuplicateContract = exports.CollectionDeleteContract = exports.CollectionUpdateContract = exports.CollectionCreateContract = exports.CollectionListContract = exports.WorkspaceDeleteContract = exports.WorkspaceRenameContract = exports.WidgetRunResultContract = exports.WidgetReadyContract = exports.WidgetSetFavoriteContract = exports.WidgetFavoritesContract = exports.WorkspaceCreateContract = exports.WorkspaceListContract = exports.WsCloseContract = exports.WsSendContract = exports.WsOpenContract = exports.MockStopContract = exports.MockStartContract = exports.MockStatusContract = exports.McpClearActivityContract = exports.McpInfoContract = exports.McpStatusContract = exports.PluginsApplyTransformerContract = exports.PluginsOpenFolderContract = exports.PluginsReloadContract = exports.PluginsListContract = exports.GrpcStreamCloseContract = exports.GrpcStreamHalfCloseContract = exports.GrpcStreamSendContract = exports.GrpcOpenStreamContract = exports.GrpcInvokeContract = exports.GrpcLoadProtoContract = exports.ResponseSaveBodyContract = exports.RequestCancelContract = exports.RequestSendContract = void 0;
+exports.MainEvent = exports.DataChangedEvent = exports.ConflictDetectedEvent = exports.SyncStateChangedEvent = exports.IPC = exports.AutoHeadersSetContract = exports.AutoHeadersGetContract = exports.OAuthExchangeCodeContract = exports.OAuthGetAuthUrlContract = exports.OAuthEnsureTokenContract = exports.GlobalsDeleteContract = exports.GlobalsSetContract = exports.GlobalsListContract = exports.TeamAuditLogContract = exports.TeamBillingPortalContract = exports.TeamBillingCheckoutContract = exports.TeamBillingContract = exports.TeamAcceptInviteContract = exports.TeamInviteContract = exports.TeamCreateContract = exports.TeamListContract = exports.ReadFileTextContract = exports.ShowFilePickerContract = exports.OpenExternalContract = exports.AppInfoContract = exports.ImportSourceContract = exports.ConflictRestoreContract = exports.ConflictDismissContract = exports.ConflictListContract = exports.SyncForceContract = exports.SyncStatusContract = exports.AuthLogoutContract = exports.AuthRegisterContract = exports.AuthLoginContract = exports.AuthStatusContract = void 0;
 const zod_1 = require("zod");
 const index_1 = require("../index");
 const uuid = zod_1.z.string().uuid();
@@ -194,6 +194,49 @@ exports.McpStatusContract = {
         url: zod_1.z.string(),
         error: zod_1.z.string().optional(),
     }),
+};
+/** Everything the in-app MCP panel shows: status, tool docs, clients, call log. */
+exports.McpInfoContract = {
+    input: zod_1.z.object({}),
+    output: zod_1.z.object({
+        status: exports.McpStatusContract.output,
+        tools: zod_1.z.array(zod_1.z.object({
+            name: zod_1.z.string(),
+            title: zod_1.z.string(),
+            description: zod_1.z.string(),
+            inputSchema: zod_1.z.record(zod_1.z.unknown()),
+            readOnly: zod_1.z.boolean(),
+            destructive: zod_1.z.boolean(),
+        })),
+        clients: zod_1.z.array(zod_1.z.object({
+            sessionId: zod_1.z.string(),
+            name: zod_1.z.string(),
+            version: zod_1.z.string().nullable(),
+            protocolVersion: zod_1.z.string().nullable(),
+            userAgent: zod_1.z.string().nullable(),
+            connectedAt: zod_1.z.number(),
+            lastSeenAt: zod_1.z.number(),
+            callCount: zod_1.z.number().int(),
+            closed: zod_1.z.boolean(),
+            active: zod_1.z.boolean(),
+        })),
+        calls: zod_1.z.array(zod_1.z.object({
+            id: zod_1.z.number().int(),
+            at: zod_1.z.number(),
+            sessionId: zod_1.z.string().nullable(),
+            clientName: zod_1.z.string(),
+            tool: zod_1.z.string(),
+            args: zod_1.z.string(),
+            ok: zod_1.z.boolean(),
+            error: zod_1.z.string().nullable(),
+            result: zod_1.z.string().nullable(),
+            durationMs: zod_1.z.number(),
+        })),
+    }),
+};
+exports.McpClearActivityContract = {
+    input: zod_1.z.object({}),
+    output: zod_1.z.object({ ok: zod_1.z.literal(true) }),
 };
 exports.MockStatusContract = {
     input: zod_1.z.object({}),
@@ -689,6 +732,8 @@ exports.IPC = {
     'grpc:streamHalfClose': exports.GrpcStreamHalfCloseContract,
     'grpc:streamClose': exports.GrpcStreamCloseContract,
     'mcp:status': exports.McpStatusContract,
+    'mcp:info': exports.McpInfoContract,
+    'mcp:clearActivity': exports.McpClearActivityContract,
     'mock:status': exports.MockStatusContract,
     'mock:start': exports.MockStartContract,
     'mock:stop': exports.MockStopContract,
