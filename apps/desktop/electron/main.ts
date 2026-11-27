@@ -15,6 +15,7 @@ import { closeDb, getDb } from './core/db/connection';
 import { restoreSession } from './core/auth/manager';
 import { registerIpcHandlers } from './ipc/handlers';
 import { bootMockServer } from './core/mock/server';
+import { startMcpServer, stopMcpServer } from './core/mcp/server';
 import { loadAllPlugins } from './core/plugins/runtime';
 import { startSync, stopSync } from './core/sync/engine';
 import { handleVoltUrl, initWidgetBridge } from './core/widget/bridge';
@@ -92,6 +93,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   stopSync();
+  stopMcpServer();
   closeDb();
 });
 
@@ -136,6 +138,10 @@ app.whenReady().then(async () => {
   setTimeout(() => {
     startSync();
   }, 2000);
+
+  // Local MCP server for AI agents (127.0.0.1 only). Needs the DB and IPC
+  // handlers; send_request waits for the renderer on its own.
+  void startMcpServer();
 
   // Mock server boots on the same timer iff the user previously left it on.
   setTimeout(() => {

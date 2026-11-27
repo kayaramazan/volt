@@ -1,4 +1,5 @@
 import {
+  Bot,
   Zap,
   Search,
   RefreshCw,
@@ -18,6 +19,7 @@ import { useAuthStatus, useEnvironments, useMockStatus, useSetActiveEnv, useActi
 import { useSelection } from '@/stores/selection';
 import { useModals } from '@/stores/modals';
 import { voltApi } from '@/lib/volt-api';
+import { useMcpInfo } from '@/components/modals/McpModal';
 
 /**
  * Top navigation bar.
@@ -133,6 +135,7 @@ export function TopBar() {
       <div className="flex items-center gap-2">
         <SyncIndicator status={syncStatus} loggedIn={authStatus?.loggedIn ?? false} />
         <MockIndicator />
+        <McpIndicator />
 
         <Button
           size="sm"
@@ -219,6 +222,31 @@ function SyncIndicator({
       {pending > 0 && (
         <span className="rounded bg-warning/20 px-1 text-warning">{pending}</span>
       )}
+    </button>
+  );
+}
+
+function McpIndicator() {
+  const { data } = useMcpInfo();
+  const { open: openModal } = useModals();
+  const running = !!data?.status.running;
+  const active = data?.clients.filter((c) => c.active).length ?? 0;
+  return (
+    <button
+      type="button"
+      onClick={() => openModal({ kind: 'mcp' })}
+      className={`flex items-center gap-1.5 rounded px-1.5 py-1 text-xs hover:bg-bg ${
+        !running ? 'text-error' : active > 0 ? 'text-success' : 'text-text-muted'
+      }`}
+      title={
+        running
+          ? `MCP server on :${data?.status.port} · ${active} active agent${active === 1 ? '' : 's'}`
+          : `MCP server not running${data?.status.error ? ` — ${data.status.error}` : ''}`
+      }
+    >
+      <Bot size={12} />
+      <span>MCP</span>
+      {active > 0 && <span className="rounded bg-success/20 px-1 text-success">{active}</span>}
     </button>
   );
 }

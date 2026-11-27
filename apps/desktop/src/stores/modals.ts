@@ -25,6 +25,7 @@ type ModalKind =
   | { kind: 'collection-mocks'; collectionId: string }
   | { kind: 'mock-settings' }
   | { kind: 'plugins' }
+  | { kind: 'mcp' }
   | { kind: 'conflicts'; workspaceId: string }
   | {
       kind: 'codegen';
