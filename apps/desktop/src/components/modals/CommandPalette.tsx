@@ -5,8 +5,6 @@ import { Globe, Plug, Puzzle, Search, FileText, FolderPlus, Link2, Upload, Setti
 import { useRequests, useCollections, useSignOut } from '@/hooks/useData';
 import { useSelection } from '@/stores/selection';
 import { useModals } from '@/stores/modals';
-import { voltApi } from '@/lib/volt-api';
-import { useQueryClient } from '@tanstack/react-query';
 import { methodColorClass, cn } from '@/lib/util';
 
 import './command-palette.css';
@@ -18,7 +16,6 @@ export function CommandPalette() {
   const { data: requests } = useRequests(workspaceId);
   const { data: collections } = useCollections(workspaceId);
   const [query, setQuery] = useState('');
-  const qc = useQueryClient();
   const signOut = useSignOut();
 
   // Reset query each open

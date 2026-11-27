@@ -10,6 +10,7 @@
 // We deliberately keep this small — no provider auto-discovery, no JWT
 // inspection, no device flow (post-MVP).
 
+import { createHash } from 'node:crypto';
 import { getOAuthToken, setOAuthToken, type OAuthToken } from '../db/queries';
 
 interface OAuth2Config {
@@ -218,8 +219,6 @@ function randomString(len: number): string {
 }
 function pkceChallenge(verifier: string): string {
   // S256: sha256(verifier) → base64url
-  // Avoiding extra deps — Node's crypto is in scope here.
-  const { createHash } = require('node:crypto') as typeof import('node:crypto');
   return base64Url(createHash('sha256').update(verifier).digest());
 }
 function base64Url(buf: Buffer): string {

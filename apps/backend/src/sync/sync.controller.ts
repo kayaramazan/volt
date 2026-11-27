@@ -13,7 +13,6 @@ import {
 import type { MessageEvent } from '@nestjs/common';
 import { Observable, map } from 'rxjs';
 import {
-  RestoreConflictInput,
   SyncPullInput,
   SyncPushInput,
 } from '@volt/shared';

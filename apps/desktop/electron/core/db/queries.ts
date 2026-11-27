@@ -5,8 +5,7 @@
 //
 // Reads return rows with JSON fields already parsed.
 
-import { and, asc, desc, eq, gt, gte, isNull, like, or, sql } from 'drizzle-orm';
-import { nanoid } from 'nanoid';
+import { and, asc, desc, eq, gt, isNull, like, or, sql } from 'drizzle-orm';
 
 import { getDb } from './connection';
 import {
@@ -819,7 +818,9 @@ export function clearDirtyFlags(
   });
 }
 
-function countDirtyTx(tx: any, workspaceId: string): number {
+type DbTx = Parameters<Parameters<ReturnType<typeof getDb>['transaction']>[0]>[0];
+
+function countDirtyTx(tx: DbTx, workspaceId: string): number {
   const c1 = tx
     .select({ count: sql<number>`COUNT(*)` })
     .from(collections)

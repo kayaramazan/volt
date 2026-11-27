@@ -11,7 +11,6 @@ import {
 } from '@volt/shared';
 
 import type { TrpcContext } from './context';
-import { requireAuth } from './context';
 import { TeamService } from '../team/team.service';
 import { WorkspaceService } from '../workspace/workspace.service';
 import { SyncService } from '../sync/sync.service';

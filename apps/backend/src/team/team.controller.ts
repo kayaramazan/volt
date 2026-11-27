@@ -11,7 +11,6 @@ import {
   UseGuards,
 } from '@nestjs/common';
 import {
-  AcceptInviteInput,
   CreateTeamInput,
   InviteTeamMemberInput,
   UpdateMemberRoleInput,

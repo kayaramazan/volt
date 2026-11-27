@@ -115,6 +115,7 @@ export function wsOpen(
 function describeBinary(bytes: Uint8Array): string {
   try {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    // eslint-disable-next-line no-control-regex -- detecting control chars is the point
     if (!/[\u0000-\u0008\u000E-\u001F]/.test(text)) return text;
   } catch {
     /* not valid UTF-8 */

@@ -10,10 +10,13 @@
 
 import { app, ipcMain, shell, dialog, BrowserWindow } from 'electron';
 import fs from 'node:fs';
-import path from 'node:path';
-import { nanoid } from 'nanoid';
 import { z } from 'zod';
-import { IPC, type IpcChannel } from '@volt/shared';
+import {
+  IPC,
+  type IpcChannel,
+  type ResolvedRequest,
+  type SendRequestOutput,
+} from '@volt/shared';
 
 import {
   createCollection,
@@ -52,7 +55,6 @@ import {
   getConflictById,
 } from '../core/db/queries';
 import { getDbPath } from '../core/db/connection';
-import { getSecret } from '../core/auth/keychain';
 import { authedFetch, currentUser, login as authLogin, logout as authLogout, register as authRegister } from '../core/auth/manager';
 import { executeRequest, cancelRequest } from '../core/http/engine';
 import {
@@ -93,7 +95,6 @@ import {
   type ScriptResponseView,
   type ScriptTestResult,
 } from '../core/scripts/runner';
-import { resolveRequest } from '../core/http/resolve';
 import { forceSync, getSyncStatus, notifyDirty, startSync, stopSync, refreshRemoteWorkspaces } from '../core/sync/engine';
 import { importPostman } from '../core/import/postman';
 import { importInsomnia } from '../core/import/insomnia';
@@ -159,7 +160,7 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         requestId,
       } = input as {
         inFlightId: string;
-        request: any;
+        request: ResolvedRequest;
         preRequestScript?: string;
         postResponseScript?: string;
         variables?: Record<string, string>;
@@ -459,7 +460,7 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       return listCollections(workspaceId);
     }
     case 'collection:create': {
-      const result = createCollection(input as any);
+      const result = createCollection(input as Parameters<typeof createCollection>[0]);
       notifyDirty();
       return result;
     }
@@ -471,7 +472,7 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
       return result;
     }
     case 'collection:update': {
-      const { id, ...patch } = input as any;
+      const { id, ...patch } = input as { id: string } & Parameters<typeof updateCollection>[1];
       const result = updateCollection(id, patch);
       notifyDirty();
       return result;
@@ -527,12 +528,12 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
     case 'apiRequest:get':
       return getRequest((input as { id: string }).id);
     case 'apiRequest:create': {
-      const result = createRequest(input as any);
+      const result = createRequest(input as Parameters<typeof createRequest>[0]);
       notifyDirty();
       return result;
     }
     case 'apiRequest:update': {
-      const { id, ...patch } = input as any;
+      const { id, ...patch } = input as { id: string } & Parameters<typeof updateRequest>[1];
       const result = updateRequest(id, patch);
       notifyDirty();
       return result;
@@ -548,12 +549,12 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
     case 'env:list':
       return listEnvironments((input as { workspaceId: string }).workspaceId);
     case 'env:create': {
-      const created = createEnvironment(input as any);
+      const created = createEnvironment(input as Parameters<typeof createEnvironment>[0]);
       notifyDirty();
       return created;
     }
     case 'env:update': {
-      const { id, ...patch } = input as any;
+      const { id, ...patch } = input as { id: string } & Parameters<typeof updateEnvironment>[1];
       const result = updateEnvironment(id, patch);
       notifyDirty();
       return result;
@@ -601,7 +602,7 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
           id: e.id,
           requestId: e.requestId,
           workspaceId: e.workspaceId,
-          method: e.method as any,
+          method: e.method,
           url: e.url,
           requestSnapshot: e.requestSnapshot,
           statusCode: e.statusCode,
@@ -620,7 +621,7 @@ async function dispatch<C extends IpcChannel>(channel: C, input: unknown): Promi
         id: e.id,
         requestId: e.requestId,
         workspaceId: e.workspaceId,
-        method: e.method as any,
+        method: e.method,
         url: e.url,
         requestSnapshot: e.requestSnapshot,
         statusCode: e.statusCode,
@@ -1075,7 +1076,7 @@ async function teamApi(method: 'GET' | 'POST' | 'PATCH' | 'DELETE', pathname: st
 // HTTP engine and the friendlier shape scripts see as `volt.request`.
 // ─────────────────────────────────────────────────────────
 
-function toScriptRequestView(req: any): ScriptRequestView {
+function toScriptRequestView(req: ResolvedRequest): ScriptRequestView {
   return {
     method: req.method,
     url: req.url,
@@ -1087,7 +1088,8 @@ function toScriptRequestView(req: any): ScriptRequestView {
     queryParams: [], // already merged into URL by client-side resolveLocally
     bodyType: req.body?.type ?? 'none',
     body: req.body,
-    auth: req.auth,
+    // The renderer may still attach the unresolved auth block; scripts can read it.
+    auth: (req as ResolvedRequest & { auth?: unknown }).auth,
   };
 }
 
@@ -1119,8 +1121,9 @@ function mergeScriptEnvVars(
   });
 }
 
-function applyScriptRequestView(req: any, view: ScriptRequestView) {
-  req.method = view.method;
+function applyScriptRequestView(req: ResolvedRequest, view: ScriptRequestView) {
+  // Script output isn't validated here; the engine rejects bad values at send time.
+  req.method = view.method as ResolvedRequest['method'];
   req.url = view.url;
   // Rebuild the headers map from the (possibly mutated) array. Honor the
   // `enabled` flag so users can disable a header from a script.
@@ -1129,7 +1132,7 @@ function applyScriptRequestView(req: any, view: ScriptRequestView) {
     if (h && h.key && h.enabled !== false) headers[h.key] = String(h.value ?? '');
   }
   req.headers = headers;
-  req.body = view.body;
+  req.body = view.body as ResolvedRequest['body'];
 }
 
 /** Shape of `preScript` / `postScript` on the send result (ScriptOutput + test results). */
@@ -1139,7 +1142,7 @@ interface ScriptOutputView {
   tests: ScriptTestResult[];
 }
 
-function toScriptResponseView(output: any): ScriptResponseView {
+function toScriptResponseView(output: SendRequestOutput): ScriptResponseView {
   if (!output.ok) {
     return {
       ok: false,

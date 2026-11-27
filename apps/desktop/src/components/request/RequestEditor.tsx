@@ -59,7 +59,7 @@ export function RequestEditor({ requestId, workspaceId, onResponse }: Props) {
   const { data: globals } = useGlobals();
   const qc = useQueryClient();
 
-  const { drafts, setDraft, clearDraft, patchDraft, setInFlight, inFlight } = useDrafts();
+  const { drafts, setDraft, patchDraft, setInFlight } = useDrafts();
   const { open: openModal } = useModals();
   const draft = drafts.get(requestId);
   const sendIdRef = useRef<string | null>(null);
