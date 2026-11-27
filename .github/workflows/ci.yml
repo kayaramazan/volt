@@ -86,7 +86,7 @@ jobs:
       - run: pnpm --filter @volt/shared --filter @volt/db build
 
       - name: Apply Prisma migrations
-        run: pnpm --filter @volt/db prisma migrate deploy
+        run: pnpm --filter @volt/db migrate:deploy
 
       - name: Run backend tests
         run: pnpm --filter @volt/backend test
