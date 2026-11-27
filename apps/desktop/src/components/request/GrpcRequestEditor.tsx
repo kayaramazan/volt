@@ -331,7 +331,6 @@ export function GrpcRequestEditor({ requestId }: Props) {
       if (sid) void voltApi['grpc:streamClose']({ connectionId: sid });
       streamIdRef.current = null;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId]);
 
   const connectStream = useCallback(async () => {

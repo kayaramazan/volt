@@ -24,7 +24,7 @@ async function getKeytar(): Promise<typeof import('keytar') | null> {
     // CJS module: dynamic import yields a namespace wrapper, so unwrap `.default`
     // (Node's named-export detection on CJS is inconsistent — see deletePassword).
     const mod = await import('keytar');
-    keytar = ((mod as any).default ?? mod) as typeof import('keytar');
+    keytar = ((mod as { default?: typeof import('keytar') }).default ?? mod) as typeof import('keytar');
     // Probe — some Linux setups load keytar but Secret Service is unavailable.
     await keytar.getPassword(SERVICE, '__probe__');
     keytarAvailable = true;

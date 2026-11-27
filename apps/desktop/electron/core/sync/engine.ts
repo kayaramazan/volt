@@ -37,7 +37,7 @@ type SyncState = 'offline' | 'syncing' | 'synced' | 'conflict' | 'error';
 
 let pushTimer: NodeJS.Timeout | null = null;
 let pullTimer: NodeJS.Timeout | null = null;
-let sseControllers = new Map<string, AbortController>();
+const sseControllers = new Map<string, AbortController>();
 let currentState: SyncState = 'offline';
 let lastSyncedAt: number | null = null;
 let lastError: string | undefined;

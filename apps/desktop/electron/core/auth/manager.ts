@@ -59,7 +59,7 @@ export async function restoreSession(): Promise<{ user: CurrentUser } | null> {
     state.user = me;
     setState(STATE_USER_KEY, JSON.stringify(me));
     return { user: me };
-  } catch (err) {
+  } catch {
     // Network failure — keep token; treat as "offline with previous identity"
     const cached = getState(STATE_USER_KEY);
     if (cached) {

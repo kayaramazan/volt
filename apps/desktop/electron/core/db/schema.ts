@@ -14,7 +14,6 @@ import {
   integer,
   sqliteTable,
   text,
-  unique,
 } from 'drizzle-orm/sqlite-core';
 
 // ─────────────────────────────────────────────────────────

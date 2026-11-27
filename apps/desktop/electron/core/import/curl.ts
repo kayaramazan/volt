@@ -165,6 +165,7 @@ export function importCurl(
       const decoded = Buffer.from(authHeader.replace(/^basic\s+/i, ''), 'base64').toString('utf-8');
       const sep = decoded.indexOf(':');
       // Only treat it as credentials when it decodes to printable `user:pass`.
+      // eslint-disable-next-line no-control-regex -- reject decoded values with control chars
       if (sep > 0 && !/[\u0000-\u0008\u000e-\u001f�]/.test(decoded)) {
         auth = { type: 'basic', username: decoded.slice(0, sep), password: decoded.slice(sep + 1) };
         headers.splice(authIdx, 1);

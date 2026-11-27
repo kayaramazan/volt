@@ -2,7 +2,7 @@ import { Lucia, TimeSpan } from 'lucia';
 import { PrismaAdapter } from '@lucia-auth/adapter-prisma';
 import { prisma } from '@volt/db';
 
-const adapter = new PrismaAdapter(prisma.session as any, prisma.user as any);
+const adapter = new PrismaAdapter(prisma.session, prisma.user);
 
 export const lucia = new Lucia(adapter, {
   // 30-day sliding expiry; refreshed on every sync request.

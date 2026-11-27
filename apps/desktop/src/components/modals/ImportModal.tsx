@@ -94,18 +94,6 @@ export function ImportModal() {
     });
   }
 
-  function applyPaste() {
-    if (!pasteDetection) return;
-    setError(null);
-    setResult(null);
-    setSource({
-      kind: pasteDetection.source,
-      label: pasteDetection.label,
-      hint: pasteDetection.hint,
-      content: paste,
-    });
-  }
-
   // Confirm the paste detection automatically whenever it changes. Lets the
   // user see the badge appear as they paste.
   useEffect(() => {

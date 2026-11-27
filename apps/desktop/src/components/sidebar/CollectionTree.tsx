@@ -118,19 +118,25 @@ export function CollectionTree({ workspaceId }: Props) {
   const searching = searchTerm.length > 0;
 
   // Build parentId → children index
-  const collectionsByParent = new Map<string | null, CollectionNode[]>();
-  for (const c of (collections ?? []) as CollectionNode[]) {
-    const parent = c.parentId ?? null;
-    if (!collectionsByParent.has(parent)) collectionsByParent.set(parent, []);
-    collectionsByParent.get(parent)!.push(c);
-  }
+  const collectionsByParent = useMemo(() => {
+    const byParent = new Map<string | null, CollectionNode[]>();
+    for (const c of (collections ?? []) as CollectionNode[]) {
+      const parent = c.parentId ?? null;
+      if (!byParent.has(parent)) byParent.set(parent, []);
+      byParent.get(parent)!.push(c);
+    }
+    return byParent;
+  }, [collections]);
 
-  const requestsByCollection = new Map<string | null, RequestNode[]>();
-  for (const r of (requests ?? []) as RequestNode[]) {
-    const key = r.collectionId ?? null;
-    if (!requestsByCollection.has(key)) requestsByCollection.set(key, []);
-    requestsByCollection.get(key)!.push(r);
-  }
+  const requestsByCollection = useMemo(() => {
+    const byCollection = new Map<string | null, RequestNode[]>();
+    for (const r of (requests ?? []) as RequestNode[]) {
+      const key = r.collectionId ?? null;
+      if (!byCollection.has(key)) byCollection.set(key, []);
+      byCollection.get(key)!.push(r);
+    }
+    return byCollection;
+  }, [requests]);
 
   const rootCollections = collectionsByParent.get(null) ?? [];
   const rootRequests = requestsByCollection.get(null) ?? [];
@@ -551,7 +557,6 @@ function CollectionItem({
   // active request changes (the user can still collapse it afterwards).
   useEffect(() => {
     if (onActivePath) setOpen(true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeRequestId, onActivePath]);
 
   function handleDragStart(e: DragEvent) {

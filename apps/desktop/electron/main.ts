@@ -8,7 +8,7 @@
 //   5. Start sync engine (2s after window appears, so UI is unblocked)
 //   6. Wire up quit handlers
 
-import { app, BrowserWindow, Menu, session } from 'electron';
+import { app, BrowserWindow, Menu, session, shell } from 'electron';
 import path from 'node:path';
 
 import { closeDb, getDb } from './core/db/connection';
@@ -202,7 +202,7 @@ function createMainWindow(): BrowserWindow {
   // Open external links in OS browser, not new Electron windows.
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (url.startsWith('http://') || url.startsWith('https://')) {
-      void require('electron').shell.openExternal(url);
+      void shell.openExternal(url);
     }
     return { action: 'deny' };
   });
